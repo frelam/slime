@@ -902,6 +902,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="KL penalty coefficient for reward shaping. This is applied to the reward signal before advantage calculation.",
             )
             parser.add_argument(
+                "--dpo-beta",
+                type=float,
+                default=0.1,
+                help=(
+                    "Beta parameter for DPO / preference-based loss. Used when "
+                    "--loss-type=custom_loss with a DPO-style custom loss function. "
+                    "Higher values tighten the KL constraint against the reference model."
+                ),
+            )
+            parser.add_argument(
                 "--loss-type",
                 type=str,
                 choices=["policy_loss", "sft_loss", "custom_loss"],
