@@ -3,6 +3,9 @@
 # GRPO/PPO Training Launcher for Agentic RL
 # =============================================================================
 #
+# Target: 2x V100 32GB with 4B model (colocate, release-train)
+# Reward: RM + Verifier mixed (7 dimensions)
+#
 # Architecture:
 #   - General tasks (terminal_bench, cli_gym, tau_bench, api_bank,
 #     agent_bench, ...) → Hermes harness + OpenAIAdapter (port 18002)
@@ -18,12 +21,17 @@
 #   - General tasks: multi-dimensional reward (RM + verifier, 7 dims)
 #   - SWE tasks: task evaluation reward only (test pass rate)
 #
+# Memory layout (colocate + release-train):
+#   Phase 1: [Megatron] train (~24GB/GPU) --release→ free
+#   Phase 2: [SGLang TP=2] rollout + RM (~18GB/GPU KV pool) --offload→ free
+#   Phase 3: repeat
+#
 # Usage:
 #   # Production (E2B + Hermes):
 #   export SLIME_AGENT_MODE=sandbox
 #   bash examples/agentic_rl_grpo/run.sh
 #
-#   # NPU smoke test (no Docker):
+#   # NPU smoke test / no Docker:
 #   export SLIME_AGENT_MODE=sglang_loop
 #   bash examples/agentic_rl_grpo/run.sh
 #
@@ -37,8 +45,8 @@
 
 set -euo pipefail
 
-# ---- Source model config ----
-# source scripts/models/qwen2.5-0.5B.sh
+# ---- 4B model config ----
+source scripts/models/qwen3-4B.sh
 
 # ---- Agent mode ----
 AGENT_MODE="${SLIME_AGENT_MODE:-sandbox}"
@@ -50,18 +58,17 @@ REWARD_WEIGHTS='{"correctness":0.51,"format":0.15,"tool_params":0.10,"retry":0.0
 MAX_TURNS="${AGENT_MAX_TURNS:-10}"
 
 # ---- Training ----
-python train_async.py \
+# NOTE: colocate 模式不支持 train_async.py，必须用 train.py（同步）
+python train.py \
     --advantage-estimator grpo \
     --loss-type policy_loss \
     \
     --custom-generate-function-path examples.agentic_rl_grpo.generate.agentic_grpo_generate \
     --custom-rm-path examples.agentic_rl_grpo.reward.agentic_grpo_reward \
-    --rollout-function-path slime.rollout.fully_async_rollout.generate_rollout_fully_async \
-    --rollout-global-dataset \
     \
-    --n-samples-per-prompt 8 \
-    --rollout-batch-size 32 \
-    --rollout-max-context-len 32768 \
+    --n-samples-per-prompt 16 \
+    --rollout-batch-size 1 \
+    --rollout-max-context-len 40960 \
     --rollout-max-response-len 8192 \
     --rollout-temperature 1.0 \
     --rollout-top-p 1.0 \
@@ -71,9 +78,19 @@ python train_async.py \
     --normalize-advantages \
     \
     --num-rollout 200 \
-    --global-batch-size 256 \
-    --num-steps-per-rollout 1 \
+    --global-batch-size 8 \
+    --num-steps-per-rollout 2 \
     --update-weights-interval 1 \
+    \
+    --colocate \
+    --actor-num-gpus-per-node 2 \
+    --num-gpus-per-node 2 \
+    --rollout-num-gpus 2 \
+    --rollout-num-gpus-per-engine 2 \
+    \
+    --release-train \
+    --update-weight-transport disk \
+    --sglang-mem-fraction-static 0.7 \
     \
     --rm-model-type sglang \
     --rm-system-prompt-dir examples/agentic_rl_grpo/prompts \
