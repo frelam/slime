@@ -90,7 +90,7 @@ class SubprocessSandbox:
         with open(path) as f:
             return f.read()
 
-    async def __aenter__(self) -> "SubprocessSandbox":
+    async def __aenter__(self) -> SubprocessSandbox:
         return self
 
     async def __aexit__(self, *args: Any) -> None:

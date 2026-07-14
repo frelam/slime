@@ -912,6 +912,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--llm-judge",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable LLM-based judging for agentic RL tasks. "
+                    "When set, each adapter's ``llm_judge()`` method is called "
+                    "after rule-based evaluation, and the scores are combined."
+                ),
+            )
+            parser.add_argument(
+                "--llm-judge-weight",
+                type=float,
+                default=0.5,
+                help=(
+                    "Weight of the LLM-judge score when combining with rule-based "
+                    "reward. Final reward = (1 - w) * rule_reward + w * llm_reward. "
+                    "Default 0.5 gives equal weight to both."
+                ),
+            )
+            parser.add_argument(
+                "--llm-judge-max-retries",
+                type=int,
+                default=2,
+                help="Max retries for LLM-judge API calls on transient failures.",
+            )
+            parser.add_argument(
                 "--loss-type",
                 type=str,
                 choices=["policy_loss", "sft_loss", "custom_loss"],
@@ -1382,6 +1408,54 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Path to a custom function that converts samples to training data. "
                     "If set, this function will replace the default _convert_samples_to_train_data. "
                     "The function should have the signature `def convert_samples_to_train_data(args, samples) -> dict`."
+                ),
+            )
+            # ---- Agentic RL GRPO/PPO reward model arguments ----
+            parser.add_argument(
+                "--rm-model-endpoint",
+                type=str,
+                default=None,
+                help=(
+                    "URL for the reward model endpoint used by agentic RL GRPO/PPO. "
+                    "Defaults to the SGLang router if not set. "
+                    "Supports OpenAI-compatible /v1/chat/completions endpoints."
+                ),
+            )
+            parser.add_argument(
+                "--rm-model-type",
+                type=str,
+                default="sglang",
+                choices=["sglang", "deepseek"],
+                help=(
+                    "Type of reward model backend. "
+                    "'sglang' uses the local SGLang router, "
+                    "'deepseek' uses the DeepSeek API."
+                ),
+            )
+            parser.add_argument(
+                "--rm-api-key",
+                type=str,
+                default=None,
+                help="API key for external reward model (e.g., DeepSeek API).",
+            )
+            parser.add_argument(
+                "--rm-system-prompt-dir",
+                type=str,
+                default="examples/agentic_rl_grpo/prompts",
+                help=(
+                    "Directory containing reward model system prompt .md files. "
+                    "Each file should be named {task_type}.md (e.g., terminal_bench.md)."
+                ),
+            )
+            parser.add_argument(
+                "--reward-weights",
+                type=str,
+                default=None,
+                help=(
+                    "JSON dict of reward dimension weights for multi-dimensional scoring. "
+                    'Example: \'{"correctness":0.51,"format":0.15,"tool_params":0.10,'
+                    '"retry":0.05,"planning":0.075,"hallucination":0.075,"tool_count":0.05}\'. '
+                    "Partial overrides are merged with defaults. Weights are normalized to sum to 1.0."
                 ),
             )
             return parser

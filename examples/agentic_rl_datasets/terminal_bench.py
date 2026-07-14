@@ -99,3 +99,87 @@ class TerminalBenchAdapter(DatasetAdapter):
                 reward -= 0.5
 
         return max(0.0, reward)
+
+    async def llm_judge(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        args: Any,
+    ) -> float | None:
+        from examples.agentic_rl.llm_judge import (
+            DEFAULT_JUDGE_SYSTEM_PROMPT,
+            build_judge_messages,
+            call_llm_judge,
+        )
+
+        system_prompt = DEFAULT_JUDGE_SYSTEM_PROMPT + (
+            "\n\nFor terminal/command-line tasks, evaluate whether the agent:"
+            "\n1. Used correct shell commands to solve the problem"
+            "\n2. Handled errors and edge cases"
+            "\n3. Produced output matching the expected result"
+        )
+        task_desc = metadata.get("prompt", "")
+        messages = build_judge_messages(system_prompt, task_desc, trajectory)
+        max_retries = getattr(args, "llm_judge_max_retries", 2)
+        return await call_llm_judge(args, messages, max_retries=max_retries)
+
+    async def analyze_trajectory(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Extract terminal-task trajectory statistics for verifier scoring."""
+        failed_commands = []
+        total_commands = 0
+        exit_codes: list[int] = []
+
+        for record in trajectory:
+            text = record.get("text", "")
+            if record.get("type") == "observation":
+                total_commands += 1
+                # Check for command failure indicators
+                if _is_terminal_failure(text):
+                    failed_commands.append({
+                        "text": text[:500],
+                        "record_index": record.get("turn", len(failed_commands)),
+                    })
+                # Try to extract exit code
+                ec = _extract_exit_code(text)
+                if ec is not None:
+                    exit_codes.append(ec)
+
+        return {
+            "total_commands": total_commands,
+            "failed_commands": len(failed_commands),
+            "failed_command_details": failed_commands,
+            "exit_codes": exit_codes,
+            "all_commands_succeeded": len(failed_commands) == 0,
+        }
+
+
+def _is_terminal_failure(text: str) -> bool:
+    """Check if a terminal observation indicates command failure."""
+    if not text:
+        return False
+    markers = [
+        "command not found",
+        "No such file or directory",
+        "Permission denied",
+        "exit status 1",
+        "exit status 2",
+        "[Error]",
+        "[ERROR]",
+        "Error:",
+        "cannot access",
+        "not found",
+    ]
+    return any(m in text for m in markers)
+
+
+def _extract_exit_code(text: str) -> int | None:
+    """Extract exit code from terminal output if present."""
+    import re
+    match = re.search(r"exit (?:status|code)\s*(\d+)", text)
+    if match:
+        return int(match.group(1))
+    return None

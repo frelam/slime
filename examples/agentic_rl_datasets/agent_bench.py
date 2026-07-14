@@ -186,6 +186,44 @@ class AgentBenchAdapter(DatasetAdapter):
             )
             return 0.0
 
+    async def llm_judge(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        args: Any,
+    ) -> float | None:
+        from examples.agentic_rl.llm_judge import (
+            DEFAULT_JUDGE_SYSTEM_PROMPT,
+            build_judge_messages,
+            call_llm_judge,
+        )
+
+        task_type = metadata.get("task_type", "os")
+        if task_type == "os":
+            extra = (
+                "\n\nFor OS/bash tasks, evaluate whether the agent:"
+                "\n1. Used correct shell commands to accomplish the goal"
+                "\n2. Handled errors appropriately"
+                "\n3. Produced the expected output or file state"
+            )
+        elif task_type == "db":
+            extra = (
+                "\n\nFor database tasks, evaluate whether the agent:"
+                "\n1. Wrote correct SQL queries"
+                "\n2. Connected to the database properly"
+                "\n3. Produced the expected query results"
+            )
+        else:
+            extra = ""
+        system_prompt = DEFAULT_JUDGE_SYSTEM_PROMPT + extra
+        task_desc = (
+            metadata.get("evaluation", {}).get("message", "")
+            or metadata.get("task_id", "")
+        )
+        messages = build_judge_messages(system_prompt, task_desc, trajectory)
+        max_retries = getattr(args, "llm_judge_max_retries", 2)
+        return await call_llm_judge(args, messages, max_retries=max_retries)
+
     # -- OS evaluation --------------------------------------------------
 
     async def _evaluate_os(

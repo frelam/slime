@@ -124,6 +124,29 @@ class APIBankAdapter(DatasetAdapter):
         logger.warning("[api_bank] No check_script or expected_api_calls; reward=0")
         return 0.0
 
+    async def llm_judge(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        args: Any,
+    ) -> float | None:
+        from examples.agentic_rl.llm_judge import (
+            DEFAULT_JUDGE_SYSTEM_PROMPT,
+            build_judge_messages,
+            call_llm_judge,
+        )
+
+        system_prompt = DEFAULT_JUDGE_SYSTEM_PROMPT + (
+            "\n\nFor API-calling tasks, evaluate whether the agent:"
+            "\n1. Read and understood the API specification correctly"
+            "\n2. Made correct API calls with proper parameters"
+            "\n3. Handled responses correctly to complete the task"
+        )
+        task_desc = metadata.get("prompt", "")
+        messages = build_judge_messages(system_prompt, task_desc, trajectory)
+        max_retries = getattr(args, "llm_judge_max_retries", 2)
+        return await call_llm_judge(args, messages, max_retries=max_retries)
+
     @staticmethod
     def _call_matches(expected: dict, actual: dict) -> bool:
         """Check if an actual API call matches the expected signature."""

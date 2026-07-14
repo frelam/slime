@@ -89,7 +89,7 @@ class TauBenchAdapter(DatasetAdapter):
         # Lazy imports so missing dependencies don't break adapter discovery.
         from tau_bench.envs import get_env
         from tau_bench.types import RunConfig
-        from examples.tau_bench.trainable_agents import InteractionResult, Status, agent_factory  # type: ignore[import-untyped]
+        from examples.tau_bench.trainable_agents import InteractionResult, agent_factory  # type: ignore[import-untyped]
 
         env_name = metadata.get("env", DEFAULT_TAU_CONFIG["env"])
         tau_config = RunConfig(
@@ -127,3 +127,27 @@ class TauBenchAdapter(DatasetAdapter):
         # by dividing by max_possible_reward (typically 1.0 for retail single-task).
         raw_reward = getattr(result, "reward", 0.0) or 0.0
         return float(min(max(raw_reward, 0.0), 1.0))
+
+    async def llm_judge(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        args: Any,
+    ) -> float | None:
+        from examples.agentic_rl.llm_judge import (
+            DEFAULT_JUDGE_SYSTEM_PROMPT,
+            build_judge_messages,
+            call_llm_judge,
+        )
+
+        env = metadata.get("env", "retail")
+        system_prompt = DEFAULT_JUDGE_SYSTEM_PROMPT + (
+            f"\n\nFor τ-bench ({env}) tasks, evaluate whether the agent:"
+            "\n1. Correctly understood the customer service scenario"
+            "\n2. Took appropriate actions using available tools"
+            "\n3. Achieved the task goal (e.g., booked flight, processed refund)"
+        )
+        task_desc = metadata.get("instruction", "")
+        messages = build_judge_messages(system_prompt, task_desc, trajectory)
+        max_retries = getattr(args, "llm_judge_max_retries", 2)
+        return await call_llm_judge(args, messages, max_retries=max_retries)

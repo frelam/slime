@@ -100,3 +100,26 @@ class CLIGymAdapter(DatasetAdapter):
 
         logger.warning("[cli_gym] No check_script or expected_state; reward=0")
         return 0.0
+
+    async def llm_judge(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        args: Any,
+    ) -> float | None:
+        from examples.agentic_rl.llm_judge import (
+            DEFAULT_JUDGE_SYSTEM_PROMPT,
+            build_judge_messages,
+            call_llm_judge,
+        )
+
+        system_prompt = DEFAULT_JUDGE_SYSTEM_PROMPT + (
+            "\n\nFor CLI/Git tasks, evaluate whether the agent:"
+            "\n1. Used correct git/shell commands"
+            "\n2. Completed all steps in the right order"
+            "\n3. Left the repository/filesystem in the expected state"
+        )
+        task_desc = metadata.get("prompt", "")
+        messages = build_judge_messages(system_prompt, task_desc, trajectory)
+        max_retries = getattr(args, "llm_judge_max_retries", 2)
+        return await call_llm_judge(args, messages, max_retries=max_retries)

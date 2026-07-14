@@ -15,12 +15,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-from pathlib import Path
 from typing import Any
 
 from examples.agentic_rl_datasets import DatasetAdapter, register_adapter
-from slime.agent.sandbox import Sandbox, ensure_agent_user, exec_and_wait
+from slime.agent.sandbox import Sandbox, ensure_agent_user
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +154,30 @@ class SWEGymLiteAdapter(DatasetAdapter):
         diff_text = await git_diff(sb, md.get("workdir", "/testbed"))
         result = await run_evaluation(md, diff_text=diff_text, timeout_sec=timeout_sec)
         return result.reward
+
+    async def llm_judge(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        args: Any,
+    ) -> float | None:
+        from examples.agentic_rl.llm_judge import (
+            DEFAULT_JUDGE_SYSTEM_PROMPT,
+            build_judge_messages,
+            call_llm_judge,
+        )
+
+        system_prompt = DEFAULT_JUDGE_SYSTEM_PROMPT + (
+            "\n\nFor SWE-bench style coding tasks, evaluate whether the agent:"
+            "\n1. Correctly understood the problem statement"
+            "\n2. Made appropriate code changes"
+            "\n3. Verified changes with tests"
+            "\nPenalize if the agent modified test files or made unrelated changes."
+        )
+        problem = metadata.get("problem_statement", "")
+        messages = build_judge_messages(system_prompt, problem, trajectory)
+        max_retries = getattr(args, "llm_judge_max_retries", 2)
+        return await call_llm_judge(args, messages, max_retries=max_retries)
 
     def _build_md(self, metadata: dict) -> dict:
         """Rebuild the metadata dict for evaluation (same shape as get_metadata)."""

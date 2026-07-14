@@ -14,7 +14,6 @@ import json
 import logging
 from typing import Any
 
-from slime.utils.http_utils import get_host_info
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -164,8 +163,6 @@ async def execute_tool_call(
     elif name in ("write_file", "file_write", "edit"):
         path = arguments.get("path", "")
         content = arguments.get("content", "")
-        mode = arguments.get("mode", "w")
-        with_ = "b" if isinstance(content, bytes) else ""
         await sandbox.exec(
             f"mkdir -p {workdir}/{os.path.dirname(path)}",
             user="agent", check=False, timeout=10,

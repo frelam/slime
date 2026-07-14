@@ -61,6 +61,48 @@ class DatasetAdapter(ABC):
         official evaluation and returns a scalar reward.
         """
 
+    async def llm_judge(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        args: Any,
+    ) -> float | None:
+        """Optional LLM-based judging for this benchmark.
+
+        Override in subclasses to provide benchmark-specific LLM-judge prompts.
+        The default returns ``None``, meaning no LLM-judge for this benchmark.
+
+        Args:
+            trajectory: List of turn dicts from the agent loop, each with
+                ``role`` and ``content`` keys.
+            metadata: Task metadata.
+            args: Slime training arguments (for endpoint info).
+
+        Returns:
+            Score in [0, 1] or None if LLM-judge is not available.
+        """
+        return None
+
+    async def analyze_trajectory(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Optional trajectory analysis for reward verifier scoring.
+
+        Extract benchmark-specific statistics from the agent's trajectory
+        for use by the multi-dimensional reward verifier.
+
+        Args:
+            trajectory: List of turn/observation dicts.
+            metadata: Task metadata.
+
+        Returns:
+            Dict with keys like ``tool_call_count``, ``failed_calls``,
+            ``retries``, ``format_issues``, etc. Default returns empty dict.
+        """
+        return {}
+
 
 # ---------------------------------------------------------------------------
 # Registry

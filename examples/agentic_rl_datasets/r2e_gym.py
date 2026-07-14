@@ -246,6 +246,30 @@ class R2EGymSubsetAdapter(DatasetAdapter):
         )
         return float(min(max(reward, 0.0), 1.0))
 
+    async def llm_judge(
+        self,
+        trajectory: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        args: Any,
+    ) -> float | None:
+        from examples.agentic_rl.llm_judge import (
+            DEFAULT_JUDGE_SYSTEM_PROMPT,
+            build_judge_messages,
+            call_llm_judge,
+        )
+
+        system_prompt = DEFAULT_JUDGE_SYSTEM_PROMPT + (
+            "\n\nFor R2E-Gym coding tasks, evaluate whether the agent:"
+            "\n1. Correctly understood the problem statement in PROBLEM_STATEMENT.md"
+            "\n2. Made targeted, correct code changes"
+            "\n3. Verified changes compile and pass tests"
+            "\nPenalize large unrelated refactors or changes to test infrastructure."
+        )
+        problem = metadata.get("problem_statement", "")
+        messages = build_judge_messages(system_prompt, problem, trajectory)
+        max_retries = getattr(args, "llm_judge_max_retries", 2)
+        return await call_llm_judge(args, messages, max_retries=max_retries)
+
     async def _run_tests(
         self,
         sb: Sandbox,

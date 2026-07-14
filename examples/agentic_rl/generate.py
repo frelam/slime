@@ -151,9 +151,31 @@ async def _generate_one_trajectory(
             workdir=workdir,
         )
 
-        # 3. Evaluate task
+        # 3. Evaluate task (rule-based)
         logger.info("Evaluating task (seed=%d) ...", seed)
         reward = await adapter.evaluate_task(sandbox, metadata)
+
+        # 4. LLM-judge (if enabled)
+        if getattr(args, "llm_judge", False):
+            logger.info("LLM-judge (seed=%d) ...", seed)
+            try:
+                llm_reward = await adapter.llm_judge(
+                    trajectory, metadata, args,
+                )
+                if llm_reward is not None:
+                    from examples.agentic_rl.llm_judge import combine_rewards
+
+                    llm_weight = getattr(args, "llm_judge_weight", 0.5)
+                    combined = combine_rewards(reward, llm_reward, llm_weight)
+                    logger.info(
+                        "LLM-judge: rule=%.3f llm=%.3f combined=%.3f (w=%.2f)",
+                        reward, llm_reward, combined, llm_weight,
+                    )
+                    reward = combined
+                else:
+                    logger.info("LLM-judge returned None (adapter does not support it)")
+            except Exception:
+                logger.exception("LLM-judge failed, using rule-based reward only")
 
     return trajectory, segment_samples, reward
 
