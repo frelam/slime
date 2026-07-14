@@ -308,7 +308,16 @@ async def agentic_grpo_generate(
     import_all()
     dataset_adapter = get_adapter(benchmark)
 
-    # 2. Route by task type
+    # 2. Check agent mode
+    agent_mode = os.environ.get("SLIME_AGENT_MODE", "sandbox")
+    if agent_mode == "sglang_loop":
+        # Local SGLang agent loop (no Docker/E2B required — NPU smoke test)
+        return await _generate_sglang_loop(
+            args, sample, sampling_params, dataset_adapter,
+            metadata, benchmark, evaluation,
+        )
+
+    # 3. Route by task type (sandbox mode)
     if benchmark in _SWE_TASK_TYPES:
         return await _generate_swe(
             args, sample, sampling_params, dataset_adapter,
@@ -319,6 +328,92 @@ async def agentic_grpo_generate(
             args, sample, sampling_params, dataset_adapter,
             metadata, benchmark, evaluation,
         )
+
+
+# =============================================================================
+# SGLang agent loop fallback (no Docker/E2B — for NPU smoke testing)
+# =============================================================================
+
+
+async def _generate_sglang_loop(
+    args: Any,
+    sample: Sample,
+    sampling_params: dict[str, Any] | None,
+    dataset_adapter: Any,
+    metadata: dict[str, Any],
+    task_type: str,
+    evaluation: bool,
+) -> list[Sample]:
+    """Generate via local SGLang agent loop (no sandbox/harness required).
+
+    Use with ``SLIME_AGENT_MODE=sglang_loop`` on machines without Docker/E2B.
+    The model running in SGLang IS the agent — it generates tool calls,
+    we execute them locally in a subprocess sandbox, and feed observations back.
+    Logprobs are captured directly from SGLang /generate responses.
+    """
+    from examples.agentic_rl.agent_loop import run_agent_loop
+    from examples.agentic_rl.sandbox import create_sandbox
+
+    workdir = metadata.get("workdir", "/home/agent")
+    max_turns = metadata.get("max_turns", int(os.environ.get("AGENT_MAX_TURNS", "10")))
+
+    async with create_sandbox(args) as sandbox:
+        # 1. Setup task environment
+        logger.info(
+            "[agentic_grpo:sglang] Setting up %s/%s",
+            task_type, metadata.get("task_id", ""),
+        )
+        await dataset_adapter.setup_task(sandbox, metadata)
+
+        # 2. Run agent loop (SGLang as the agent)
+        logger.info(
+            "[agentic_grpo:sglang] Running SGLang agent loop for %s", task_type,
+        )
+        trajectory, segment_samples = await run_agent_loop(
+            args, sample, sandbox, sampling_params or {},
+            max_turns=max_turns, workdir=workdir,
+        )
+
+        # 3. Evaluate task
+        try:
+            task_reward = await dataset_adapter.evaluate_task(
+                sandbox, metadata, timeout_sec=CONFIG["eval_timeout_sec"],
+            )
+        except Exception:
+            logger.exception("Task evaluation failed for %s", task_type)
+            task_reward = 0.0
+
+        if evaluation:
+            if segment_samples:
+                segment_samples[-1].reward = task_reward
+            return segment_samples if segment_samples else [sample]
+
+        # 4. Compute multi-dimensional reward (general tasks only)
+        task_description = (
+            sample.prompt if isinstance(sample.prompt, str) else str(sample.prompt)
+        )
+        from examples.agentic_rl_grpo.reward import (
+            compute_multi_dimensional_reward,
+        )
+
+        breakdown = await compute_multi_dimensional_reward(
+            args, trajectory, task_description, task_type,
+            task_eval_reward=task_reward,
+        )
+
+        # 5. Stamp reward
+        for seg in segment_samples:
+            seg.reward = breakdown.total
+            if seg.metadata is None:
+                seg.metadata = {}
+            seg.metadata["reward_dimensions"] = breakdown.to_dict()
+            seg.metadata["benchmark"] = task_type
+
+        logger.info(
+            "[agentic_grpo:sglang] %s: reward=%.3f turns=%d samples=%d",
+            task_type, breakdown.total, len(trajectory), len(segment_samples),
+        )
+        return segment_samples
 
 
 # =============================================================================

@@ -9,19 +9,30 @@
 #   - SWE tasks (swe_gym_lite, r2e_gym) → Claude Code harness +
 #     AnthropicAdapter (port 18001)
 #
+# Agent modes (SLIME_AGENT_MODE env var):
+#   - sandbox   (default): E2B sandbox + Hermes/Claude Code harness
+#   - sglang_loop:         Local SGLang agent loop, no Docker/E2B needed
+#                           (use for NPU smoke testing or machines without Docker)
+#
 # Reward:
 #   - General tasks: multi-dimensional reward (RM + verifier, 7 dims)
 #   - SWE tasks: task evaluation reward only (test pass rate)
 #
 # Usage:
+#   # Production (E2B + Hermes):
+#   export SLIME_AGENT_MODE=sandbox
 #   bash examples/agentic_rl_grpo/run.sh
 #
-# Required environment variables:
-#   ADAPTER_PUBLIC_HOST         — host IP reachable by E2B sandboxes
-#   SLIME_E2B_SANDBOX_IMAGE     — default E2B image for general tasks
-#   SLIME_AGENT_NODE_TARBALL    — path to Node.js tarball
-#   SLIME_AGENT_HERMES_TARBALL  — path to Hermes CLI tarball
-#   SLIME_AGENT_CC_TARBALL      — path to Claude Code CLI tarball (SWE tasks)
+#   # NPU smoke test (no Docker):
+#   export SLIME_AGENT_MODE=sglang_loop
+#   bash examples/agentic_rl_grpo/run.sh
+#
+# Required env vars (sandbox mode):
+#   ADAPTER_PUBLIC_HOST, SLIME_E2B_SANDBOX_IMAGE,
+#   SLIME_AGENT_NODE_TARBALL, SLIME_AGENT_HERMES_TARBALL
+#
+# Required env vars (sglang_loop mode):
+#   (none — uses local subprocess)
 # =============================================================================
 
 set -euo pipefail
@@ -29,8 +40,14 @@ set -euo pipefail
 # ---- Source model config ----
 # source scripts/models/qwen2.5-0.5B.sh
 
+# ---- Agent mode ----
+AGENT_MODE="${SLIME_AGENT_MODE:-sandbox}"
+
 # ---- Multi-dimensional reward weights (general tasks only) ----
 REWARD_WEIGHTS='{"correctness":0.51,"format":0.15,"tool_params":0.10,"retry":0.05,"planning":0.075,"hallucination":0.075,"tool_count":0.05}'
+
+# ---- Per-turn limits (sglang_loop mode) ----
+MAX_TURNS="${AGENT_MAX_TURNS:-10}"
 
 # ---- Training ----
 python train_async.py \
