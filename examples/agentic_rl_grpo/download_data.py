@@ -1147,6 +1147,234 @@ def _write_jsonl(path: Path, tasks: list[dict[str, Any]]) -> None:
 
 
 # =============================================================================
+# Data validation & preprocessing
+# =============================================================================
+
+# Required fields per benchmark (beyond the universal prompt + label + metadata)
+_REQUIRED_METADATA: dict[str, list[str]] = {
+    "swe_gym_lite": ["instance_id"],
+    "r2e_gym": ["instance_id"],
+    "terminal_bench": ["task_id"],
+    "tau_bench": ["task_index", "env"],
+    "cli_gym": ["task_id"],
+    "api_bank": ["task_id"],
+    "agent_bench": ["task_type", "task_id"],
+}
+
+# Fields that suggest SWE evaluability (should NOT be empty for SWE tasks)
+_SWE_CRITICAL_FIELDS = [
+    "repo", "base_commit", "FAIL_TO_PASS", "PASS_TO_PASS", "test_patch",
+]
+
+
+def validate_tasks(tasks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict]:
+    """Validate and clean tasks, returning (valid_tasks, report).
+
+    Checks:
+    - prompt is non-empty string
+    - metadata.benchmark is present and recognized
+    - Per-benchmark required metadata fields are present
+    - SWE tasks have critical grading fields (warn, don't drop)
+    - Deduplicates by (prompt, benchmark) to catch near-duplicates
+
+    Returns:
+        (valid_tasks, report_dict)
+    """
+    report = {
+        "total": len(tasks),
+        "valid": 0,
+        "dropped_empty_prompt": 0,
+        "dropped_no_benchmark": 0,
+        "dropped_missing_fields": 0,
+        "warned_swe_missing_critical": 0,
+        "warned_duplicates": 0,
+        "by_benchmark": {},  # benchmark → count
+        "issues": [],  # list of (severity, benchmark, instance_id, message)
+    }
+
+    valid: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()  # (prompt[:200], benchmark)
+
+    for task in tasks:
+        prompt = task.get("prompt", "")
+        metadata = task.get("metadata") or {}
+        benchmark = metadata.get("benchmark", "")
+        label = task.get("label", "?")
+
+        # 1. Non-empty prompt
+        if not prompt or not str(prompt).strip():
+            report["dropped_empty_prompt"] += 1
+            report["issues"].append((
+                "ERROR", benchmark or "unknown", str(label),
+                "Empty prompt — dropped",
+            ))
+            continue
+
+        # 2. Must have a known benchmark
+        if not benchmark:
+            report["dropped_no_benchmark"] += 1
+            report["issues"].append((
+                "ERROR", "unknown", str(label),
+                "Missing metadata.benchmark — dropped",
+            ))
+            continue
+
+        # 3. Check required metadata fields
+        required = _REQUIRED_METADATA.get(benchmark, [])
+        missing = [f for f in required if f not in metadata or metadata[f] is None]
+        if missing:
+            report["dropped_missing_fields"] += 1
+            report["issues"].append((
+                "ERROR", benchmark, str(label),
+                f"Missing required metadata fields: {missing} — dropped",
+            ))
+            continue
+
+        # 4. SWE-specific: warn on missing critical grading fields
+        if benchmark in ("swe_gym_lite", "r2e_gym"):
+            critical_missing = [
+                f for f in _SWE_CRITICAL_FIELDS
+                if not metadata.get(f) and not metadata.get("remote_env_info", {}).get(f)
+            ]
+            if critical_missing:
+                report["warned_swe_missing_critical"] += 1
+                report["issues"].append((
+                    "WARN", benchmark, str(label),
+                    f"SWE task missing critical grading fields: {critical_missing} "
+                    f"— reward may be unreliable",
+                ))
+
+        # 5. Dedup by prompt prefix + benchmark
+        key = (str(prompt)[:200], benchmark)
+        if key in seen:
+            report["warned_duplicates"] += 1
+            report["issues"].append((
+                "WARN", benchmark, str(label),
+                "Near-duplicate prompt — skipped",
+            ))
+            continue
+        seen.add(key)
+
+        valid.append(task)
+        report["valid"] += 1
+        report["by_benchmark"][benchmark] = (
+            report["by_benchmark"].get(benchmark, 0) + 1
+        )
+
+    return valid, report
+
+
+def print_validation_report(report: dict) -> None:
+    """Print a human-readable validation report."""
+    logger.info("=" * 60)
+    logger.info("Data Validation Report")
+    logger.info("=" * 60)
+    logger.info("  Total input:      %5d", report["total"])
+    logger.info("  Valid:            %5d", report["valid"])
+    logger.info("  Dropped:")
+    if report["dropped_empty_prompt"]:
+        logger.info("    empty prompt:   %5d", report["dropped_empty_prompt"])
+    if report["dropped_no_benchmark"]:
+        logger.info("    no benchmark:   %5d", report["dropped_no_benchmark"])
+    if report["dropped_missing_fields"]:
+        logger.info("    missing fields: %5d", report["dropped_missing_fields"])
+    if report["warned_swe_missing_critical"]:
+        logger.info("  ⚠ SWE missing critical fields: %d", report["warned_swe_missing_critical"])
+    if report["warned_duplicates"]:
+        logger.info("  ⚠ Near-duplicates skipped: %d", report["warned_duplicates"])
+
+    logger.info("  By benchmark:")
+    for bench, count in sorted(report["by_benchmark"].items()):
+        logger.info("    %-20s %5d", bench, count)
+
+    # Print first few issues
+    if report["issues"]:
+        logger.info("  Issues (first 10):")
+        for severity, bench, label, msg in report["issues"][:10]:
+            logger.info("    [%s] %s/%s: %s", severity, bench, label, msg)
+        if len(report["issues"]) > 10:
+            logger.info("    ... and %d more", len(report["issues"]) - 10)
+
+    logger.info("=" * 60)
+
+
+def preprocess_with_tokenizer(
+    tasks: list[dict[str, Any]],
+    tokenizer_path: str,
+    max_prompt_len: int | None = None,
+) -> list[dict[str, Any]]:
+    """Apply chat template and optionally filter by token length.
+
+    Args:
+        tasks: List of task dicts with ``prompt`` as raw string.
+        tokenizer_path: Path to HF checkpoint (same as --hf-checkpoint).
+        max_prompt_len: If set, drop tasks whose tokenized prompt exceeds this.
+
+    Returns:
+        Filtered tasks with chat-template-applied prompts.
+    """
+    from transformers import AutoTokenizer
+
+    logger.info("Loading tokenizer from %s ...", tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+
+    lengths: list[int] = []
+    valid: list[dict[str, Any]] = []
+    dropped_long = 0
+
+    for task in tasks:
+        prompt = task.get("prompt", "")
+
+        # Convert to messages and apply chat template
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            logger.warning(
+                "Chat template failed for %s, using raw prompt",
+                task.get("label", "?"),
+            )
+            rendered = prompt
+
+        # Tokenize for length check
+        token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+        n_tokens = len(token_ids)
+        lengths.append(n_tokens)
+
+        if max_prompt_len and n_tokens > max_prompt_len:
+            dropped_long += 1
+            continue
+
+        task["prompt"] = rendered
+        # Store token count in metadata for reference
+        task.setdefault("metadata", {})["_prompt_tokens"] = n_tokens
+        valid.append(task)
+
+    # Statistics
+    if lengths:
+        lengths.sort()
+        logger.info("Prompt token statistics (after chat template):")
+        logger.info("  count:  %d", len(lengths))
+        logger.info("  min:    %d", lengths[0])
+        logger.info("  p25:    %d", lengths[len(lengths) // 4])
+        logger.info("  median: %d", lengths[len(lengths) // 2])
+        logger.info("  p75:    %d", lengths[3 * len(lengths) // 4])
+        logger.info("  p95:    %d", lengths[95 * len(lengths) // 100])
+        logger.info("  max:    %d", lengths[-1])
+
+    if dropped_long:
+        logger.info(
+            "  Dropped >%d tokens: %d tasks", max_prompt_len, dropped_long,
+        )
+
+    return valid
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1242,6 +1470,25 @@ Use with run.sh:
              "Or pass a full URL. Also reads HF_ENDPOINT env var.",
     )
     parser.add_argument(
+        "--tokenizer-path",
+        default=None,
+        help="HF model path for tokenizer (same as --hf-checkpoint in run.sh). "
+             "When set: applies chat template, reports token-length stats. "
+             "Requires: pip install transformers",
+    )
+    parser.add_argument(
+        "--max-prompt-len",
+        type=int,
+        default=None,
+        help="Drop prompts exceeding this token count after chat template. "
+             "Requires --tokenizer-path.",
+    )
+    parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="Skip data validation (not recommended)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be downloaded without actually downloading",
@@ -1333,6 +1580,44 @@ Use with run.sh:
         )
         if p:
             paths.append(p)
+
+    # ---- Validate all generated files ----
+    if not args.dry_run and not args.no_validate:
+        for p in paths:
+            if not p.exists():
+                continue
+            tasks = []
+            with open(p) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        tasks.append(json.loads(line))
+            if not tasks:
+                logger.warning("No tasks in %s, skipping validation", p.name)
+                continue
+            logger.info("Validating %s (%d tasks)...", p.name, len(tasks))
+            valid_tasks, report = validate_tasks(tasks)
+            _write_jsonl(p, valid_tasks)  # overwrite with cleaned data
+            print_validation_report(report)
+
+    # ---- Apply chat template + length filter (if tokenizer provided) ----
+    if args.tokenizer_path and not args.dry_run:
+        for p in paths:
+            if not p.exists():
+                continue
+            tasks = []
+            with open(p) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        tasks.append(json.loads(line))
+            if not tasks:
+                continue
+            logger.info("Preprocessing %s with tokenizer...", p.name)
+            tasks = preprocess_with_tokenizer(
+                tasks, args.tokenizer_path, args.max_prompt_len,
+            )
+            _write_jsonl(p, tasks)
 
     # ---- Merge ----
     if not args.no_merge and len(paths) >= 1 and not args.dry_run:
