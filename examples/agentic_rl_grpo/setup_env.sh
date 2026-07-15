@@ -23,6 +23,12 @@
 #   # Faster setup (skip SGLang source patches — pip only):
 #   SLIME_SGLANG_PIP_ONLY=1 bash examples/agentic_rl_grpo/setup_env.sh
 #
+#   # Use a specific pip mirror:
+#   SLIME_PIP_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple bash examples/agentic_rl_grpo/setup_env.sh
+#
+#   # Force default PyPI (no mirror):
+#   SLIME_PIP_MIRROR="" bash examples/agentic_rl_grpo/setup_env.sh
+#
 # What this script does:
 #   1. Checks system requirements (CUDA, Python, gcc, git)
 #   2. Creates a Python virtual environment (venv or conda)
@@ -70,6 +76,11 @@ SGLANG_REPO="${SLIME_SGLANG_REPO:-https://github.com/sgl-project/sglang.git}"
 # Default: apply patches (if available) for full slime compatibility.
 SGLANG_PIP_ONLY="${SLIME_SGLANG_PIP_ONLY:-0}"
 
+# Pip mirror for faster downloads. Auto-detect if in China → use Tsinghua.
+# Set explicitly: SLIME_PIP_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
+# Disable mirror:  SLIME_PIP_MIRROR=""
+PIP_MIRROR="${SLIME_PIP_MIRROR:-auto}"
+
 # Patch version (matches docker/patch/<version>/)
 PATCH_VERSION="${SLIME_PATCH_VERSION:-latest}"
 
@@ -95,6 +106,54 @@ log_info()  { echo -e "${GREEN}[INFO]${NC}  $(date '+%H:%M:%S') $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $(date '+%H:%M:%S') $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%H:%M:%S') $*"; }
 log_step()  { echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; echo -e "${BLUE}▶${NC} $*"; echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
+
+# ---- Pip mirror auto-detection ----
+
+# Chinese mirrors (order: Tsinghua → Aliyun → USTC)
+_MIRROR_CANDIDATES=(
+    "https://pypi.tuna.tsinghua.edu.cn/simple"
+    "https://mirrors.aliyun.com/pypi/simple"
+    "https://pypi.mirrors.ustc.edu.cn/simple"
+)
+
+resolve_pip_mirror() {
+    # Explicitly set
+    if [ "$PIP_MIRROR" != "auto" ]; then
+        echo "$PIP_MIRROR"
+        return
+    fi
+
+    # Auto: test if we're in China by checking latency to Baidu DNS
+    if timeout 1 bash -c "echo >/dev/tcp/180.101.50.242/53" 2>/dev/null; then
+        # Test each mirror, return first reachable
+        for mirror in "${_MIRROR_CANDIDATES[@]}"; do
+            if curl -s --connect-timeout 3 --max-time 5 -o /dev/null "$mirror" 2>/dev/null; then
+                echo "$mirror"
+                return
+            fi
+        done
+    fi
+
+    # Fallback: empty (use default PyPI)
+    echo ""
+}
+
+PIP_MIRROR_URL="$(resolve_pip_mirror)"
+
+if [ -n "$PIP_MIRROR_URL" ]; then
+    log_info "Using pip mirror: $PIP_MIRROR_URL"
+else
+    log_info "Using default PyPI (no mirror configured)"
+fi
+
+# pip wrapper that adds mirror flag automatically
+_pip() {
+    if [ -n "$PIP_MIRROR_URL" ]; then
+        pip "$@" -i "$PIP_MIRROR_URL"
+    else
+        pip "$@"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Check system requirements
@@ -248,7 +307,7 @@ create_environment() {
         source "$VENV_DIR/bin/activate"
 
         # Upgrade pip
-        pip install --upgrade pip setuptools wheel
+        _pip install --upgrade pip setuptools wheel
 
         log_info "Venv '$VENV_DIR' ready ✓"
         PYTHON_BIN="$VENV_DIR/bin/python3"
@@ -280,16 +339,25 @@ install_pytorch() {
         TORCH_CUDA="cu124"  # CUDA 12.4+
     fi
 
-    log_info "Installing PyTorch with $TORCH_CUDA support..."
-
     # For V100, use PyTorch 2.5.x (most stable for SM70)
     # For newer GPUs, use latest stable
     if [ "${IS_V100:-0}" -eq 1 ]; then
         TORCH_VERSION="2.5.1"
         log_info "V100 detected → installing PyTorch $TORCH_VERSION (stable for SM70)"
-        pip install torch=="$TORCH_VERSION" --index-url "https://download.pytorch.org/whl/$TORCH_CUDA"
+        TORCH_SPEC="torch==$TORCH_VERSION"
     else
-        pip install torch --index-url "https://download.pytorch.org/whl/$TORCH_CUDA"
+        TORCH_SPEC="torch"
+    fi
+
+    # PyTorch CUDA wheels: mirrors like Tsinghua/Aliyun DO host them, so we can
+    # use the mirror here directly (much faster in China). On default PyPI we
+    # must use the pytorch.org index because PyPI doesn't host CUDA wheels.
+    if [ -n "$PIP_MIRROR_URL" ]; then
+        log_info "Installing PyTorch via mirror ($PIP_MIRROR_URL)..."
+        _pip install "$TORCH_SPEC" torchvision torchaudio
+    else
+        log_info "Installing PyTorch from pytorch.org ($TORCH_CUDA)..."
+        pip install "$TORCH_SPEC" --index-url "https://download.pytorch.org/whl/$TORCH_CUDA"
     fi
 
     # Verify installation
@@ -358,11 +426,11 @@ install_megatron() {
     fi
 
     # Force numpy < 2 (Megatron requirement)
-    pip install "numpy<2"
+    _pip install "numpy<2"
 
     # Install Megatron
     log_info "Installing Megatron-LM..."
-    pip install -e . --no-deps 2>&1 | tail -5
+    _pip install -e . --no-deps 2>&1 | tail -5
 
     # Verify
     if python3 -c "import megatron" 2>/dev/null; then
@@ -394,7 +462,7 @@ install_sglang() {
 
     # ---- Phase 1: pip-install SGLang for compiled kernels ----
     log_info "Installing SGLang via pip (precompiled kernels)..."
-    pip install "sglang[all]" 2>&1 | tail -5 || {
+    _pip install "sglang[all]" 2>&1 | tail -5 || {
         log_error "SGLang pip install failed."
         exit 1
     }
@@ -473,7 +541,7 @@ install_sglang() {
 
     # Editable install (replaces Python code, keeps pip-installed compiled extensions)
     log_info "Installing patched SGLang in editable mode..."
-    pip install -e "python" --no-deps --no-build-isolation 2>&1 | tail -5 || {
+    _pip install -e "python" --no-deps --no-build-isolation 2>&1 | tail -5 || {
         log_warn "SGLang editable install failed. Pip-installed version will be used."
     }
 
@@ -484,7 +552,7 @@ install_sglang() {
     else
         log_error "SGLang import failed after patching!"
         log_error "Reinstalling SGLang via pip as fallback..."
-        pip install "sglang[all]" --force-reinstall 2>&1 | tail -3
+        _pip install "sglang[all]" --force-reinstall 2>&1 | tail -3
         log_info "SGLang reinstalled via pip (without patches)"
     fi
 }
@@ -499,7 +567,7 @@ install_python_deps() {
     # ---- Base dependencies (always needed) ----
     log_info "Installing base dependencies..."
 
-    pip install \
+    _pip install \
         pyyaml \
         safetensors \
         transformers \
@@ -522,7 +590,7 @@ install_python_deps() {
 
     # ---- ring_flash_attn (replaces flash-attn on V100) ----
     log_info "Installing ring_flash_attn..."
-    pip install ring_flash_attn 2>/dev/null || {
+    _pip install ring_flash_attn 2>/dev/null || {
         log_warn "ring_flash_attn install failed. Continuing..."
     }
 
@@ -531,7 +599,7 @@ install_python_deps() {
         log_warn "Skipping flash-attn (requires SM80+, V100 is SM70)"
     else
         log_info "Installing flash-attn..."
-        MAX_JOBS="$MAX_JOBS" pip install flash-attn --no-build-isolation 2>/dev/null || {
+        MAX_JOBS="$MAX_JOBS" _pip install flash-attn --no-build-isolation 2>/dev/null || {
             log_warn "flash-attn install failed. Using ring_flash_attn fallback."
         }
     fi
@@ -541,7 +609,7 @@ install_python_deps() {
         log_warn "Skipping transformer_engine (requires SM80+, V100 is SM70)"
     else
         log_info "Installing transformer_engine..."
-        pip install "transformer_engine[pytorch]" --no-build-isolation 2>/dev/null || {
+        _pip install "transformer_engine[pytorch]" --no-build-isolation 2>/dev/null || {
             log_warn "transformer_engine install failed. Continuing..."
         }
     fi
@@ -556,7 +624,7 @@ install_python_deps() {
         fi
         if [ -d "$HOME/apex" ]; then
             cd "$HOME/apex"
-            pip install -v --disable-pip-version-check --no-cache-dir \
+            _pip install -v --disable-pip-version-check --no-cache-dir \
                 --no-build-isolation \
                 --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
                 . 2>&1 | tail -5 || log_warn "APEX install failed. Continuing..."
@@ -565,7 +633,7 @@ install_python_deps() {
 
     # ---- SGLang Router (for weight sync) ----
     log_info "Installing sglang-router..."
-    pip install "sglang-router>=0.2.3" 2>/dev/null || {
+    _pip install "sglang-router>=0.2.3" 2>/dev/null || {
         log_warn "sglang-router from PyPI failed. Trying GitHub release..."
         pip install https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl 2>/dev/null || {
             log_warn "sglang-router wheel failed. Continuing..."
@@ -592,18 +660,18 @@ install_python_deps() {
     }
 
     # ---- nvidia-modelopt (optional, for model optimization) ----
-    pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation 2>/dev/null || {
+    _pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation 2>/dev/null || {
         log_warn "nvidia-modelopt install failed. Continuing..."
     }
 
     # ---- emerging-optimizers (Muon optimizer for GRPO) ----
     log_info "Installing emerging-optimizers (Muon optimizer)..."
-    pip install emerging-optimizers 2>/dev/null || {
+    _pip install emerging-optimizers 2>/dev/null || {
         log_warn "emerging-optimizers install failed. Muon optimizer won't be available."
     }
 
     # ---- sgl_kernel (optional, for SGLang performance) ----
-    pip install sgl-kernel 2>/dev/null || {
+    _pip install sgl-kernel 2>/dev/null || {
         log_warn "sgl-kernel install failed. Continuing..."
     }
 
@@ -611,7 +679,7 @@ install_python_deps() {
     if [ "$SETUP_MODE" = "full" ]; then
         log_info "Installing full-mode dependencies (sandbox + harnesses)..."
 
-        pip install \
+        _pip install \
             e2b \
             anthropic \
             openai \
@@ -621,7 +689,7 @@ install_python_deps() {
             docker
 
         # swebench (for SWE-bench evaluation)
-        pip install swebench 2>/dev/null || {
+        _pip install swebench 2>/dev/null || {
             log_warn "swebench install failed. SWE-bench evaluation won't work."
         }
 
@@ -633,13 +701,13 @@ install_python_deps() {
     # ---- Install slime itself ----
     log_info "Installing slime from $SLIME_ROOT..."
     cd "$SLIME_ROOT"
-    pip install -e . --no-deps
+    _pip install -e . --no-deps
 
     # Install int4_qat kernels if available
     if [ -f "$SLIME_ROOT/slime/backends/megatron_utils/kernels/int4_qat/setup.py" ]; then
         log_info "Installing int4_qat kernels..."
         cd "$SLIME_ROOT/slime/backends/megatron_utils/kernels/int4_qat"
-        pip install . --no-build-isolation 2>/dev/null || log_warn "int4_qat install failed."
+        _pip install . --no-build-isolation 2>/dev/null || log_warn "int4_qat install failed."
     fi
 
     # Verify slime installation
@@ -769,6 +837,9 @@ main() {
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║   slime Agentic RL GRPO — Environment Setup                 ║"
     echo "║   Mode: $SETUP_MODE                                          ║"
+    if [ -n "$PIP_MIRROR_URL" ]; then
+        echo "║   Mirror: $PIP_MIRROR_URL"
+    fi
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo ""
 
