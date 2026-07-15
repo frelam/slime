@@ -57,6 +57,32 @@ REWARD_WEIGHTS='{"correctness":0.51,"format":0.15,"tool_params":0.10,"retry":0.0
 # ---- Per-turn limits (sglang_loop mode) ----
 MAX_TURNS="${AGENT_MAX_TURNS:-10}"
 
+# ---- Optimizer (Muon + Adam chained) ----
+# Muon (orthogonalized SGD) handles 2D linear weights (Attention QKV/O, FFN),
+# Adam handles 1D params (biases, layernorm, embeddings).
+# Weight decay: 0.01 for RL (lower than SFT's 0.1, prevents reward hacking).
+# Requires: pip install emerging-optimizers
+OPTIMIZER_ARGS=(
+    --optimizer muon
+    --lr 3e-4
+    --lr-decay-style constant
+    --weight-decay 0.01
+    --muon-momentum 0.95
+    --muon-use-nesterov
+    --muon-scale-mode spectral
+    --muon-num-ns-steps 5
+)
+
+# ---- DAPO-style Dynamic Sampling ----
+# Filter out prompts where all 16 samples have identical reward (too easy or too hard),
+# then oversample from the data source to maintain diversity.
+DAPO_ARGS=(
+    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+    --over-sampling-batch-size 2
+    --use-dynamic-batch-size
+    --max-tokens-per-gpu 9216
+)
+
 # ---- Training ----
 # NOTE: colocate 模式不支持 train_async.py，必须用 train.py（同步）
 python train.py \
@@ -67,7 +93,7 @@ python train.py \
     --custom-rm-path examples.agentic_rl_grpo.reward.agentic_grpo_reward \
     \
     --n-samples-per-prompt 16 \
-    --rollout-batch-size 1 \
+    --rollout-batch-size 4 \
     --rollout-max-context-len 40960 \
     --rollout-max-response-len 8192 \
     --rollout-temperature 1.0 \
@@ -75,11 +101,11 @@ python train.py \
     \
     --kl-coef 0.001 \
     --kl-loss-type k3 \
+    --entropy-coef 0.001 \
     --normalize-advantages \
     \
-    --num-rollout 200 \
-    --global-batch-size 8 \
-    --num-steps-per-rollout 2 \
+    --num-rollout 500 \
+    --global-batch-size 1 \
     --update-weights-interval 1 \
     \
     --colocate \
@@ -102,4 +128,7 @@ python train.py \
     --metadata-key metadata \
     --apply-chat-template \
     --rollout-shuffle \
+    \
+    "${OPTIMIZER_ARGS[@]}" \
+    "${DAPO_ARGS[@]}" \
     "$@"
