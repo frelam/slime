@@ -23,6 +23,14 @@ Usage::
     # Skip synthetic data generation:
     python examples/agentic_rl_grpo/download_data.py -o ./data --no-synthetic
 
+    # Use HF mirror (for users behind firewalls / in China):
+    python examples/agentic_rl_grpo/download_data.py -o ./data --hf-mirror hf-mirror.com
+
+    # Use locally downloaded files (skip HF entirely):
+    python examples/agentic_rl_grpo/download_data.py -o ./data \\
+        --swe-input /path/to/swe_bench_verified.jsonl \\
+        --r2e-input /path/to/r2e_gym.jsonl
+
 Requirements::
 
     pip install datasets huggingface_hub pyyaml
@@ -80,6 +88,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -111,6 +120,43 @@ _DEFAULT_NUM_SYNTHETIC = 64
 # =============================================================================
 # HuggingFace helpers
 # =============================================================================
+
+# Known HF mirrors (set via --hf-mirror or HF_ENDPOINT env var)
+_HF_MIRRORS = {
+    "hf-mirror.com": "https://hf-mirror.com",
+}
+
+
+def _setup_hf_endpoint(mirror: str | None = None) -> None:
+    """Configure the HuggingFace endpoint BEFORE any HF imports.
+
+    Must be called before ``_ensure_datasets()`` or ``_maybe_login_hf()``.
+    HF libraries read ``HF_ENDPOINT`` at import time, so we set it in
+    ``os.environ`` early.
+
+    Args:
+        mirror: One of the known mirror keys (e.g. ``"hf-mirror.com"``)
+                or a full URL. If None, checks ``HF_ENDPOINT`` env var.
+    """
+    endpoint = None
+
+    if mirror:
+        # Check if it's a known shortcut
+        endpoint = _HF_MIRRORS.get(mirror, mirror)
+    else:
+        endpoint = os.environ.get("HF_ENDPOINT", "")
+
+    if endpoint:
+        os.environ["HF_ENDPOINT"] = endpoint
+        # Also set for the datasets library (some versions read this instead)
+        os.environ.setdefault("HF_DATASETS_ENDPOINT", endpoint)
+        logger.info("HF endpoint: %s", endpoint)
+    else:
+        logger.info(
+            "HF endpoint: https://huggingface.co (default). "
+            "If you're behind a firewall, set --hf-mirror hf-mirror.com "
+            "or export HF_ENDPOINT=https://hf-mirror.com"
+        )
 
 
 def _ensure_datasets():
@@ -153,13 +199,37 @@ def download_swe_gym_lite(
     output_dir: Path,
     max_samples: int | None = None,
     dry_run: bool = False,
+    local_input: str | None = None,
 ) -> Path | None:
     """Download SWE-bench Verified + SWE-Gym Lite, output unified JSONL.
 
+    Args:
+        local_input: If provided, load from this local JSONL file instead of
+            downloading from HuggingFace. The file should be in SWE-bench
+            or scaleswe format (auto-detected).
+
     Returns the output file path or None if nothing was downloaded.
     """
-    load_dataset = _ensure_datasets()
     tasks: list[dict[str, Any]] = []
+
+    # ---- Local input (skip HF download entirely) ----
+    if local_input:
+        logger.info("Loading SWE data from local file: %s", local_input)
+        tasks = _load_local_swe_data(local_input)
+        if not tasks:
+            logger.warning("No tasks loaded from %s", local_input)
+            return None
+        tasks = _deduplicate_by(tasks, key=lambda t: t["metadata"]["instance_id"])
+        if max_samples:
+            tasks = tasks[:max_samples]
+        output_path = output_dir / "swe_gym_lite.jsonl"
+        if not dry_run:
+            _write_jsonl(output_path, tasks)
+        logger.info("  Wrote %d SWE tasks → %s", len(tasks), output_path)
+        return output_path
+
+    # ---- HF download path ----
+    load_dataset = _ensure_datasets()
 
     # ---- SWE-bench Verified ----
     logger.info("Downloading SWE-bench Verified from HF...")
@@ -291,8 +361,37 @@ def download_r2e_gym(
     output_dir: Path,
     max_samples: int | None = None,
     dry_run: bool = False,
+    local_input: str | None = None,
 ) -> Path | None:
-    """Download R2E-Gym Lite from HuggingFace."""
+    """Download R2E-Gym Lite from HuggingFace.
+
+    Args:
+        local_input: If provided, load from this local JSONL file (or hf:split)
+            instead of downloading from the default HF dataset.
+    """
+    tasks: list[dict[str, Any]] = []
+
+    # ---- Local input ----
+    if local_input:
+        logger.info("Loading R2E data from: %s", local_input)
+        from examples.agentic_rl_datasets.r2e_gym import R2EGymSubsetAdapter
+        adapter = R2EGymSubsetAdapter()
+        tasks = adapter.load_dataset(local_input)
+        if not tasks:
+            logger.warning("No tasks loaded from %s", local_input)
+            return None
+        for t in tasks:
+            t["metadata"]["benchmark"] = "r2e_gym"
+        tasks = _deduplicate_by(tasks, key=lambda t: t["metadata"]["instance_id"])
+        if max_samples:
+            tasks = tasks[:max_samples]
+        output_path = output_dir / "r2e_gym.jsonl"
+        if not dry_run:
+            _write_jsonl(output_path, tasks)
+        logger.info("  Wrote %d R2E-Gym tasks → %s", len(tasks), output_path)
+        return output_path
+
+    # ---- HF download path ----
     load_dataset = _ensure_datasets()
     tasks: list[dict[str, Any]] = []
 
@@ -962,6 +1061,20 @@ def _generate_api_bank_tasks(num_tasks: int) -> list[dict[str, Any]]:
 # =============================================================================
 
 
+def _load_local_swe_data(path: str) -> list[dict[str, Any]]:
+    """Load SWE tasks from a local JSONL file (SWE-bench or scaleswe format).
+
+    Uses the same auto-detection logic as ``SWEGymLiteAdapter.load_dataset()``.
+    """
+    from examples.agentic_rl_datasets.swe_gym_lite import SWEGymLiteAdapter
+
+    adapter = SWEGymLiteAdapter()
+    tasks = adapter.load_dataset(path)
+    for t in tasks:
+        t["metadata"]["benchmark"] = "swe_gym_lite"
+    return tasks
+
+
 def _swebench_image(repo: str) -> str:
     """Derive SWE-bench Docker image name from repo.
 
@@ -1056,6 +1169,10 @@ Examples:
   # No synthetic data, limited samples
   python examples/agentic_rl_grpo/download_data.py -o ./data --no-synthetic --max-samples 200
 
+  # Use HF mirror (for users behind firewalls):
+  python examples/agentic_rl_grpo/download_data.py -o ./data --hf-mirror hf-mirror.com
+  # Or: export HF_ENDPOINT=https://hf-mirror.com
+
   # Include AgentBench with custom input
   python examples/agentic_rl_grpo/download_data.py -o ./data --agent-bench-input /path/to/agent_bench.jsonl
 
@@ -1107,11 +1224,32 @@ Use with run.sh:
         help="Path to AgentBench JSONL (required if agent_bench is in --benchmarks)",
     )
     parser.add_argument(
+        "--swe-input",
+        default=None,
+        help="Local JSONL file for SWE tasks (SWE-bench or scaleswe format). "
+             "When set, skips HF download for swe_gym_lite and uses this file.",
+    )
+    parser.add_argument(
+        "--r2e-input",
+        default=None,
+        help="Local JSONL file (or hf:split) for R2E-Gym tasks. "
+             "When set, skips HF download for r2e_gym and uses this path.",
+    )
+    parser.add_argument(
+        "--hf-mirror",
+        default=None,
+        help="HF mirror to use for downloads. Known shortcuts: hf-mirror.com. "
+             "Or pass a full URL. Also reads HF_ENDPOINT env var.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be downloaded without actually downloading",
     )
     args = parser.parse_args()
+
+    # ---- Configure HF endpoint BEFORE any HF imports ----
+    _setup_hf_endpoint(args.hf_mirror)
 
     # Resolve benchmark list
     all_benchmarks = [
@@ -1143,6 +1281,7 @@ Use with run.sh:
     if "swe_gym_lite" in benchmarks:
         p = download_swe_gym_lite(
             output_dir, args.max_samples, args.dry_run,
+            local_input=args.swe_input,
         )
         if p:
             paths.append(p)
@@ -1150,6 +1289,7 @@ Use with run.sh:
     if "r2e_gym" in benchmarks:
         p = download_r2e_gym(
             output_dir, args.max_samples, args.dry_run,
+            local_input=args.r2e_input,
         )
         if p:
             paths.append(p)
