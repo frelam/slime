@@ -134,3 +134,8 @@ def import_all() -> None:
     import examples.agentic_rl_datasets.api_bank  # noqa: F401
     import examples.agentic_rl_datasets.r2e_gym  # noqa: F401
     import examples.agentic_rl_datasets.agent_bench  # noqa: F401
+    # Simple datasets (sglang_loop mode)
+    import examples.agentic_rl_datasets.simple_datasets  # noqa: F401
+    import examples.agentic_rl_datasets.alfworld  # noqa: F401
+    # Tool RL datasets (function calling / tool use)
+    import examples.agentic_rl_datasets.tool_datasets  # noqa: F401
