@@ -362,20 +362,42 @@ async def _bash_step(action: str, metadata: dict[str, Any]) -> tuple[str, bool]:
     """Execute action as a bash command in the current sandbox.
 
     Used as fallback when dataset adapter doesn't provide env_step().
+
+    Security note: ``action`` originates from the model output and is
+    inherently a shell command — this is the intended design for terminal
+    agent tasks.  The action runs in an ephemeral subprocess sandbox with
+    a minimal environment (PATH + HOME only) and a validated workdir.
     """
     import asyncio
     import os
+    import re
+    import shlex
     import subprocess
     import tempfile
 
     workdir = metadata.get("workdir", tempfile.gettempdir())
 
+    # Validate workdir is a safe path (prevent traversal)
+    allowed_prefixes = ("/home/agent", "/tmp/", "/home/charles/workspace")
+    resolved = os.path.normpath(os.path.realpath(workdir))
+    if not any(resolved.startswith(p) for p in allowed_prefixes):
+        resolved = tempfile.mkdtemp(prefix="slime_sandbox_")
+
+    # Minimal env: only what a terminal command legitimately needs
+    safe_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": resolved,
+        "USER": "agent",
+        "PWD": resolved,
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+
     proc = await asyncio.create_subprocess_shell(
         action,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=workdir,
-        env={**os.environ},
+        cwd=resolved,
+        env=safe_env,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)

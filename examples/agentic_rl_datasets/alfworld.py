@@ -343,13 +343,25 @@ class ALFWorldAdapter(DatasetAdapter):
         """Execute action in the synthetic file-system environment.
 
         Returns (observation_text, done).
+
+        Security: ``cmd`` is constructed entirely from hardcoded safe strings
+        (room names, object names) and a validated ``workdir``.  The model's
+        ``action`` is only used for pattern matching, never injected into the
+        shell command.  ``workdir`` is quoted and validated.
         """
         import asyncio
         import os as _os
+        import shlex as _shlex
         import subprocess as _sp
         import tempfile as _tf
 
         workdir = metadata.get("_workdir", "/home/agent")
+
+        # Validate workdir
+        resolved = _os.path.normpath(_os.path.realpath(workdir))
+        if not resolved.startswith(("/home/agent", "/tmp/")):
+            resolved = "/home/agent"
+        wd = _shlex.quote(resolved)
 
         # Parse common ALFWorld-style actions into shell commands
         action_lower = action.lower().strip()
@@ -365,7 +377,7 @@ class ALFWorldAdapter(DatasetAdapter):
                       "lobby", "office_a", "office_b", "server_room",
                       "break_room", "hallway"]:
             if room.replace("_", " ") in action_lower:
-                cmd = f"cd {workdir}/{room} && pwd && ls -la"
+                cmd = f"cd {wd}/{room} && pwd && ls -la"
 
         # look / examine / check / read / cat
         if cmd is None and any(w in action_lower for w in
@@ -376,33 +388,41 @@ class ALFWorldAdapter(DatasetAdapter):
                         "fridge", "desk", "shelf", "counter", "sink", "drawer",
                         "cabinet", "report", "server_status", "coffee_machine"]:
                 if obj in words:
-                    cmd = f"find {workdir} -name '*{obj}*' -exec cat {{}} \\; 2>/dev/null || echo 'Not found: {obj}'"
+                    cmd = f"find {wd} -name '*{obj}*' -exec cat {{}} \\; 2>/dev/null || echo 'Not found: {obj}'"
 
         # take / pick up / get / grab
         if cmd is None and any(w in action_lower for w in
                                 ["take", "pick up", "get", "grab", "collect"]):
-            cmd = f"find {workdir} -type f | head -20"
+            cmd = f"find {wd} -type f | head -20"
 
         # put / place / move / mv
         if cmd is None and any(w in action_lower for w in
                                 ["put", "place", "move", "mv", "bring"]):
-            cmd = f"ls -R {workdir} 2>/dev/null | head -40"
+            cmd = f"ls -R {wd} 2>/dev/null | head -40"
 
         # clean / wash / rinse
         if cmd is None and any(w in action_lower for w in
                                 ["clean", "wash", "rinse", "wipe"]):
-            cmd = f"echo 'cleaned' && find {workdir} -name '*.txt' | head -10"
+            cmd = f"echo 'cleaned' && find {wd} -name '*.txt' | head -10"
 
         # generic explore
         if cmd is None:
-            cmd = f"cd {workdir} && pwd && ls -R 2>/dev/null | head -30"
+            cmd = f"cd {wd} && pwd && ls -R 2>/dev/null | head -30"
+
+        # Minimal env for sandbox execution
+        safe_env = {
+            "PATH": _os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": resolved,
+            "USER": "agent",
+            "LANG": _os.environ.get("LANG", "C.UTF-8"),
+        }
 
         # Run the command
         proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=_sp.PIPE,
             stderr=_sp.PIPE,
-            env={**_os.environ},
+            env=safe_env,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)

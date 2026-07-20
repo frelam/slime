@@ -159,12 +159,26 @@ class SimpleMathAdapter(DatasetAdapter):
         verify_code = metadata.get("verify_code", "")
         expected_answer = str(metadata.get("expected_answer", "")).strip()
 
-        # Method 1: Run verify code
+        # Method 1: Run verify code (written to temp file to avoid
+        # command injection via single-quote escaping in -c '...')
         if verify_code:
             try:
+                import secrets
+                import shlex
+
+                # Write verify_code to a temp .py file, then execute it.
+                # Avoids shell injection through -c quoting.
+                verify_code = verify_code.replace("\\n", "\n").replace("\\t", "    ")
+                tmp_name = f"/home/agent/_verify_{secrets.token_hex(8)}.py"
+                await sb.write_file(tmp_name, verify_code, user="agent")
                 ec, stdout, stderr = await sb.exec(
-                    f"python3 -c '{verify_code}'",
+                    f"python3 {shlex.quote(tmp_name)}",
                     user="agent", check=False, timeout=timeout_sec,
+                )
+                # Clean up
+                await sb.exec(
+                    f"rm -f {shlex.quote(tmp_name)}",
+                    user="agent", check=False, timeout=10,
                 )
                 if ec == 0:
                     return 1.0
