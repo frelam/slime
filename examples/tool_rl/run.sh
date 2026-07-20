@@ -101,7 +101,7 @@ if [ ! -f "${PROMPT_DATA}" ]; then
     echo "[run_tool_rl] Data not found at ${PROMPT_DATA}"
     echo "[run_tool_rl] Downloading tool-use datasets..."
     echo "============================================"
-    python examples/agentic_rl_grpo/download_tool_data.py \
+    python examples/tool_rl/data/download_data.py \
         -o "${DATA_DIR}" --max-samples 5000
 
     if [ ! -f "${PROMPT_DATA}" ]; then
@@ -142,8 +142,8 @@ python train.py \
     --advantage-estimator grpo \
     --loss-type policy_loss \
     \
-    --custom-generate-function-path examples.agentic_rl_grpo.tool_rl_generate.tool_rl_grpo_generate \
-    --custom-rm-path examples.agentic_rl_grpo.tool_rl_reward.tool_rl_reward \
+    --custom-generate-function-path examples.tool_rl.generate.tool_rl_grpo_generate \
+    --custom-rm-path examples.tool_rl.reward.reward.tool_rl_reward \
     \
     --n-samples-per-prompt 16 \
     --rollout-batch-size 4 \

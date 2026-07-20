@@ -3,8 +3,8 @@
 Plug into slime via ``--custom-generate-function-path``::
 
     python train.py \\
-        --custom-generate-function-path examples.agentic_rl_grpo.tool_rl_generate.tool_rl_grpo_generate \\
-        --custom-rm-path examples.agentic_rl_grpo.tool_rl_reward.tool_rl_reward \\
+        --custom-generate-function-path examples.tool_rl.generate.tool_rl_grpo_generate \\
+        --custom-rm-path examples.tool_rl.reward.reward.tool_rl_reward \\
         --input-key messages \\
         --tool-key tools \\
         --apply-chat-template \\
@@ -229,7 +229,7 @@ async def tool_rl_grpo_generate(
             # 4. Compute 4-dim reward
             ground_truth_label = sample.label or ""
 
-            from examples.agentic_rl_grpo.tool_rl_reward import (
+            from examples.tool_rl.reward.reward import (
                 compute_tool_rl_reward,
             )
 

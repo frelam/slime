@@ -125,7 +125,7 @@ async def compute_tool_rl_reward(
     Returns:
         ``ToolRLRewardBreakdown`` with all 4 dimension scores.
     """
-    from examples.agentic_rl_grpo.tool_rl_verifier import compute_verifier_scores
+    from examples.tool_rl.reward.verifier import compute_verifier_scores
 
     weights = get_weights(args)
 

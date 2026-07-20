@@ -138,4 +138,4 @@ def import_all() -> None:
     import examples.agentic_rl_datasets.simple_datasets  # noqa: F401
     import examples.agentic_rl_datasets.alfworld  # noqa: F401
     # Tool RL datasets (function calling / tool use)
-    import examples.agentic_rl_datasets.tool_datasets  # noqa: F401
+    import examples.tool_rl.data.dataset_adapter  # noqa: F401
