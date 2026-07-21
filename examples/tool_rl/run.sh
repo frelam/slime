@@ -71,6 +71,12 @@ RM_MODEL_ENDPOINT="${RM_MODEL_ENDPOINT:-}"
 # RM API key is read from RM_API_KEY env var directly by tool_rl_reward.py
 # (NOT passed as CLI arg — avoids exposure in /proc and ps output)
 
+# ---- KL Loss (regularization toward reference model) ----
+# Prevents the policy from diverging too far from the reference during GRPO.
+# k3 = forward KL with low-variance estimator (recommended for GRPO).
+KL_COEF="${KL_COEF:-0.001}"
+KL_LOSS_TYPE="${KL_LOSS_TYPE:-k3}"
+
 # ---- Optimizer (Muon + Adam, chained) ----
 OPTIMIZER_ARGS=(
     --optimizer muon
@@ -83,13 +89,28 @@ OPTIMIZER_ARGS=(
     --muon-num-ns-steps 5
 )
 
-# ---- DAPO-style Dynamic Sampling ----
-DAPO_ARGS=(
-    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-    --over-sampling-batch-size 2
-    --use-dynamic-batch-size
-    --max-tokens-per-gpu 9216
-)
+# ---- Dynamic Sampling (std-based filtering) ----
+# Keeps only prompt groups where the rollout rewards have non-zero std.
+# This ensures every training batch has meaningful advantage signals.
+# Tuning knobs:
+#   DYNAMIC_SAMPLING_FILTER — filter function path
+#   OVER_SAMPLING_BATCH_SIZE — oversample factor (2 = generate 2x, keep best)
+DYNAMIC_SAMPLING="${DYNAMIC_SAMPLING:-true}"
+DYNAMIC_SAMPLING_FILTER="${DYNAMIC_SAMPLING_FILTER:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-2}"
+USE_DYNAMIC_BATCH_SIZE="${USE_DYNAMIC_BATCH_SIZE:-true}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-9216}"
+
+if [ "${DYNAMIC_SAMPLING}" = "true" ]; then
+    DAPO_ARGS=(
+        --dynamic-sampling-filter-path "${DYNAMIC_SAMPLING_FILTER}"
+        --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}"
+        --use-dynamic-batch-size
+        --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+    )
+else
+    DAPO_ARGS=()
+fi
 
 # ---- Default data path ----
 DATA_DIR="${TOOL_RL_DATA_DIR:-./data/tool_rl}"
@@ -117,12 +138,14 @@ fi
 echo "============================================"
 echo "[run_tool_rl] Tool RL GRPO Training"
 echo "============================================"
-echo "  Agent mode:    ${SLIME_AGENT_MODE}"
-echo "  Max turns:     ${AGENT_MAX_TURNS}"
-echo "  Mock mode:     ${TOOL_RL_MOCK_MODE}"
-echo "  Data:          ${PROMPT_DATA}"
-echo "  RM type:       ${RM_MODEL_TYPE}"
-echo "  Reward:        4-dim (planning + format + tool_call + hallucination)"
+echo "  Agent mode:       ${SLIME_AGENT_MODE}"
+echo "  Max turns:        ${AGENT_MAX_TURNS}"
+echo "  Mock mode:        ${TOOL_RL_MOCK_MODE}"
+echo "  Data:             ${PROMPT_DATA}"
+echo "  RM type:          ${RM_MODEL_TYPE}"
+echo "  Reward:           4-dim (planning + format + tool_call + hallucination)"
+echo "  KL loss:          coef=${KL_COEF}, type=${KL_LOSS_TYPE}"
+echo "  Dynamic sampling: ${DYNAMIC_SAMPLING} (filter=${DYNAMIC_SAMPLING_FILTER##*.})"
 echo "============================================"
 
 # ---- Build RM args ----
@@ -152,8 +175,8 @@ python train.py \
     --rollout-temperature 1.0 \
     --rollout-top-p 1.0 \
     \
-    --kl-coef 0.001 \
-    --kl-loss-type k3 \
+    --kl-coef "${KL_COEF}" \
+    --kl-loss-type "${KL_LOSS_TYPE}" \
     --entropy-coef 0.001 \
     --normalize-advantages \
     \
