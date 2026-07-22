@@ -9,6 +9,9 @@ def convert_qwen2_to_hf(args, name, param):
         return [("lm_head.weight", param)]
     if name == "module.module.decoder.final_layernorm.weight":
         return [("model.norm.weight", param)]
+    # Position embeddings (learned when --transformer-impl local without RoPE)
+    if name == "module.module.embedding.position_embeddings.weight":
+        return [("model.embed_positions.weight", param)]
 
     try:
         head_dim = args.kv_channels if args.kv_channels is not None else args.hidden_size // args.num_attention_heads
@@ -67,5 +70,19 @@ def convert_qwen2_to_hf(args, name, param):
             return [(f"model.layers.{layer_idx}.self_attn.q_norm.weight", param)]
         elif rest == "self_attention.k_layernorm.weight":
             return [(f"model.layers.{layer_idx}.self_attn.k_norm.weight", param)]
+
+        # Direct layer norm (RMSNorm) — used by Qwen3 with local transformer impl
+        elif rest == "input_layernorm.weight":
+            return [(f"model.layers.{layer_idx}.input_layernorm.weight", param)]
+        elif rest == "post_attention_layernorm.weight":
+            return [(f"model.layers.{layer_idx}.post_attention_layernorm.weight", param)]
+        elif rest == "pre_mlp_layernorm.weight":
+            return [(f"model.layers.{layer_idx}.post_attention_layernorm.weight", param)]
+
+    if re.match(decoder_layers_pattern, name):
+        # Catch-all: any unknown param is passed through as-is without the
+        # module.module.decoder.layers.N prefix.
+        hf_name = re.sub(decoder_layers_pattern, r"model.layers.\1.\2", name)
+        return [(hf_name, param)]
 
     raise ValueError(f"Unknown parameter name: {name}")

@@ -19,29 +19,33 @@
 #
 # Usage:
 #   # 1. Download data first:
-#   python examples/agentic_rl_grpo/download_tool_data.py -o ./data/tool_rl
+#   python examples/tool_rl/data/download_data.py -o ./data/tool_rl
 #
 #   # 2. Train:
-#   bash examples/agentic_rl_grpo/run_tool_rl.sh
+#   bash examples/tool_rl/run.sh
 #
 #   # 3. Custom data path:
-#   bash examples/agentic_rl_grpo/run_tool_rl.sh \
+#   bash examples/tool_rl/run.sh \
 #       --prompt-data ./data/tool_rl/mixed_tool_rl.jsonl
 #
 #   # 4. Smoke test (few rollouts):
-#   bash examples/agentic_rl_grpo/run_tool_rl.sh \
+#   bash examples/tool_rl/run.sh \
 #       --num-rollout 5 --n-samples-per-prompt 4
 #
 #   # 5. Custom reward weights:
-#   bash examples/agentic_rl_grpo/run_tool_rl.sh \
+#   bash examples/tool_rl/run.sh \
 #       --reward-weights '{"planning":0.5,"format":0.15,"tool_call":0.15,"hallucination":0.2}'
 #
 #   # 6. Use specific RM (DeepSeek API):
 #   RM_MODEL_TYPE=deepseek RM_API_KEY=sk-xxx \
-#   bash examples/agentic_rl_grpo/run_tool_rl.sh
+#   bash examples/tool_rl/run.sh
 # =============================================================================
 
 set -euo pipefail
+
+# ---- Project root & Megatron-LM namespace ----
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/Megatron-LM:${PYTHONPATH:-}"
 
 # ---- Model config (default: Qwen3-4B) ----
 MODEL_CONFIG="${MODEL_CONFIG:-scripts/models/qwen3-4B.sh}"

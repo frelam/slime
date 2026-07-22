@@ -8,6 +8,30 @@ from urllib.parse import quote
 
 import requests
 import sglang_router
+
+
+def _run_sglang_server(server_args, log_path):
+    """Run SGLang server with stderr redirected to a file."""
+    import sys
+    import traceback
+
+    try:
+        _log = open(log_path, "w")
+        sys.stderr = _log
+        from sglang.srt.entrypoints.http_server import launch_server
+
+        launch_server(server_args)
+    except Exception:
+        with open(log_path + ".crash", "w") as f:
+            f.write(traceback.format_exc())
+        raise
+    finally:
+        try:
+            _log.close()
+        except Exception:
+            pass
+
+
 from packaging.version import parse
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -58,23 +82,47 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
             wait_for_server=True,
         )
 
-    from sglang.srt.entrypoints.http_server import launch_server
-
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+
+    # Ensure CUDA_VISIBLE_DEVICES is set
+    import os
+
+    if "CUDA_VISIBLE_DEVICES" not in os.environ or not os.environ["CUDA_VISIBLE_DEVICES"]:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    # Redirect child process stderr to a temp file for debugging
+    import tempfile
+
+    _log_fd, _log_path = tempfile.mkstemp(suffix=".log", prefix="sglang_spawn_", dir="/tmp")
+    os.close(_log_fd)
+
+    p = multiprocessing.Process(target=_run_sglang_server, args=(server_args, _log_path))
     p.start()
 
-    if getattr(server_args, "node_rank", 0) != 0:
-        return p
+    # Give the server extra time to start (up to 5 min)
+    import time
 
-    _wait_server_healthy(
-        base_url=server_args.url(),
-        api_key=server_args.api_key,
-        is_process_alive=lambda: p.is_alive(),
-    )
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        if not p.is_alive():
+            raise Exception("Server process terminated unexpectedly.")
+        try:
+            import requests
 
-    return p
+            resp = requests.get(
+                f"{server_args.url()}/health_generate",
+                timeout=5,
+                headers={} if not server_args.api_key else {"Authorization": f"Bearer {server_args.api_key}"},
+            )
+            if resp.status_code == 200:
+                logger.info("SGLang server ready at %s", server_args.url())
+                break
+        except requests.RequestException:
+            pass
+        time.sleep(5)
+    else:
+        raise Exception("Server failed to start within 300s")
 
 
 def _wait_server_healthy(base_url, api_key, is_process_alive):
@@ -572,6 +620,8 @@ def _compute_server_args(
         "ep_size": args.sglang_ep_size,
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
+        # disable CUDA graph for compatibility with stubs
+        "disable_cuda_graph": True,
         # always enable draft weights cpu backup so that we run training without mtp weights.
         "enable_draft_weights_cpu_backup": True,
         # Always enable Prometheus metrics so the router /engine_metrics endpoint

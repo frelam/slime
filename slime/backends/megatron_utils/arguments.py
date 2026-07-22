@@ -164,6 +164,28 @@ def _set_default_megatron_args(args):
     if hasattr(args, "rope_type") and args.rope_type is None:
         args.rope_type = "yarn" if args.multi_latent_attention else "rope"
 
+    # slime-specific defaults not set by megatron's validate_args
+    # (e.g. OptimizerParamScheduler expects these, but they come from
+    #  megatron's own yaml_arguments module, not the standard args parser)
+    _opt_scheduler_defaults = {
+        "start_weight_decay": getattr(args, "weight_decay", 0.01),
+        "end_weight_decay": getattr(args, "weight_decay", 0.01),
+        "weight_decay_incr_style": "constant",
+        "use_checkpoint_opt_param_scheduler": False,
+        "override_opt_param_scheduler": False,
+        "lr_wsd_decay_style": "linear",
+    }
+    for _attr, _default in _opt_scheduler_defaults.items():
+        if not hasattr(args, _attr) or getattr(args, _attr) is None:
+            setattr(args, _attr, _default)
+
+    # HF checkpoint loading: use "raw" mode for direct HF weight loading.
+    # "bridge" mode would need megatron.bridge models which aren't available
+    # in this checkout.  For standard decoder-only models like Qwen3, "raw"
+    # works via HfWeightIteratorDirect.
+    if not hasattr(args, "megatron_to_hf_mode"):
+        args.megatron_to_hf_mode = "raw"
+
     if args.vocab_size and not args.padded_vocab_size:
         args.padded_vocab_size = _vocab_size_with_padding(args.vocab_size, args)
 
@@ -196,4 +218,10 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
     args.rank = 0
     args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
     args = _set_default_megatron_args(args)
+    # Re-validate after updating world_size so derived attributes like
+    # data_parallel_size are computed correctly for the actor.
+    try:
+        _megatron_validate_args(args)
+    except Exception:
+        logger.debug("megatron validate_args after world_size set: not applicable (e.g., --perform-rl-step)", exc_info=True)
     return args

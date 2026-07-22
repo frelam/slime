@@ -32,6 +32,23 @@ def _set_random_seed(
 
 def _initialize_distributed(args, get_embedding_ranks=None, get_position_embedding_ranks=None):
     """Initialize torch.distributed and core model parallel."""
+    # Set defaults for Megatron attributes that might not be in the actor's args namespace
+    _megatron_defaults = {
+        "virtual_pipeline_model_parallel_size": None,
+        "enable_gloo_process_groups": True,
+        "pipeline_model_parallel_comm_backend": None,
+        "context_parallel_size": 1,
+        "hierarchical_context_parallel_sizes": None,
+        "expert_model_parallel_size": 1,
+        "num_distributed_optimizer_instances": None,
+        "expert_tensor_parallel_size": 1,
+        "distributed_timeout_minutes": 30,
+        "nccl_communicator_config_path": None,
+        "use_tp_pp_dp_mapping": False,
+    }
+    for attr, default in _megatron_defaults.items():
+        if not hasattr(args, attr) or getattr(args, attr) is None:
+            setattr(args, attr, default)
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     mpu.initialize_model_parallel(

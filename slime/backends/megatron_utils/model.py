@@ -425,7 +425,9 @@ def forward_only(
             "position_ids": None,
             "attention_mask": None,
             "labels": None,
-            "packed_seq_params": packed_seq_params,
+            # Packed sequences (THD format) require TEDotProductAttention.
+            # Fall back to unbatched (variable-length) processing for local impl.
+            "packed_seq_params": packed_seq_params if getattr(args, "transformer_impl", None) == "transformer_engine" else None,
             "loss_mask": batch["full_loss_masks"],
         }
         if batch["multimodal_train_inputs"] is not None:

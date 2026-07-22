@@ -29,6 +29,7 @@ Dim 4 — RM scored (hallucination):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -196,7 +197,7 @@ async def _call_rm(
 
     # 1. System prompt
     prompt_dir = getattr(args, "rm_system_prompt_dir",
-                         "examples/agentic_rl_grpo/prompts")
+                         "examples/tool_rl/reward/prompts")
     system_prompt = _load_prompt("tool_rl", prompt_dir)
 
     # 2. User message
@@ -355,8 +356,27 @@ def _format_traj(trajectory: list[dict]) -> str:
 # ============================================================================
 
 
-async def tool_rl_reward(args: Any, sample: Any) -> float:
-    """Reward for ``--custom-rm-path``. Pass-through from generate phase."""
+async def tool_rl_reward(args: Any, sample: Any) -> float | list[float]:
+    """Reward for ``--custom-rm-path``. Pass-through from generate phase.
+
+    NOTE: ``batched_async_rm`` passes a ``list[Sample]`` to custom RM
+    functions when ``--custom-rm-path`` is set.  We expect the reward was
+    already computed during generation (``tool_rl_grpo_generate``), so
+    we simply extract it from each sample.
+    """
+    if isinstance(sample, list):
+        # Batched mode: list[Sample] — reward already set in generate
+        rewards = []
+        for s in sample:
+            r = _extract_reward(s)
+            rewards.append(r)
+        return rewards
+
+    return _extract_reward(sample)
+
+
+def _extract_reward(sample: Any) -> float:
+    """Extract the pre-computed reward from a sample."""
     if sample.reward is not None:
         try:
             return float(sample.reward)
@@ -369,10 +389,12 @@ async def tool_rl_reward(args: Any, sample: Any) -> float:
         tools = metadata.get("tools", [])
         desc = sample.prompt if isinstance(sample.prompt, str) else ""
         gt_label = sample.label or ""
-        bd = await compute_tool_rl_reward(
-            args, traj, desc,
-            available_tools=tools,
-            ground_truth_label=gt_label,
+        bd = asyncio.run(
+            compute_tool_rl_reward(
+                None, traj, desc,
+                available_tools=tools,
+                ground_truth_label=gt_label,
+            )
         )
         return bd.total
 

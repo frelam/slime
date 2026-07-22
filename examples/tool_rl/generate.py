@@ -136,6 +136,20 @@ def _response_to_trajectory(text: str) -> list[dict[str, Any]]:
             args[pm.group(1)] = pval
         tool_calls.append({"name": func_match.group(1), "arguments": args})
 
+    # Fallback: JSON format tool calls
+    if not tool_calls:
+        _TOOL_CALL_JSON_RE = re.compile(
+            r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^{}]*\}\s*\}',
+            re.DOTALL,
+        )
+        for m in _TOOL_CALL_JSON_RE.finditer(text):
+            try:
+                obj = json.loads(m.group(0))
+                if "name" in obj:
+                    tool_calls.append(obj)
+            except json.JSONDecodeError:
+                pass
+
     return [{
         "turn": 0,
         "text": text,
@@ -242,10 +256,12 @@ async def tool_rl_grpo_generate(
 
             # 5. Build output Sample
             full_tokens = list(input_ids) + (output_ids if output_ids else [])
-            full_logprobs = [0.0] * len(input_ids) + (
+            # Log-probs and loss mask cover only the response portion,
+            # since the training actor expects len(log_prob) == response_length.
+            rollout_log_probs = (
                 logprobs if logprobs else [0.0] * response_len
             )
-            full_loss_mask = [0] * len(input_ids) + [2] * response_len
+            loss_mask = [2] * response_len
 
             result = Sample(
                 index=sample.index,
@@ -255,8 +271,8 @@ async def tool_rl_grpo_generate(
                 tokens=full_tokens,
                 response=output_text,
                 response_length=response_len,
-                loss_mask=full_loss_mask,
-                rollout_log_probs=full_logprobs,
+                loss_mask=loss_mask,
+                rollout_log_probs=rollout_log_probs,
                 reward=reward,
                 status="completed",
                 metadata={
