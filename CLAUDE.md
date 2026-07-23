@@ -74,60 +74,12 @@ python train.py "${MODEL_ARGS[@]}" <ckpt_args> <rollout_args> <grpo_args> <sglan
 
 ### Key Packages
 
-```
-slime/
-├── ray/                    # Ray-based orchestration layer
-│   ├── rollout.py          # RolloutManager (Ray actor) — manages SGLang engines, weight sync, data gathering
-│   ├── placement_group.py  # GPU provisioning: creates Ray placement groups for train/rollout actors
-│   ├── actor_group.py      # RayTrainGroup — wraps Megatron training on a Ray actor group
-│   ├── train_actor.py      # TrainActor (Ray actor) — single training worker
-│   └── rollout_validation.py  # Validates server-group GPU indices
-│
-├── rollout/                # Rollout logic & data flow
-│   ├── sglang_rollout.py   # Core SGLang rollout — generate_rollout(), reward computation, RM integration
-│   ├── sglang_streaming_rollout.py  # Streaming partial rollout (for long generations)
-│   ├── fully_async_rollout.py       # Rollout + train fully async (no blocking)
-│   ├── data_source.py      # DataSource base class + RolloutDataSource (prompt management, sampling)
-│   ├── base_types.py       # RolloutFnTrainOutput, RolloutFnEvalOutput
-│   ├── filter_hub/         # Dynamic sampling filters (e.g., top-p, temperature)
-│   └── rm_hub/             # Reward model integrations: math, GPQA, F1, DeepScaler, IFBench
-│
-├── agent/                  # Agentic RL / coding-agent harnesses
-│   ├── trajectory.py       # TrajectoryManager — multi-turn conversation tree → training samples
-│   ├── sandbox.py          # Sandbox execution for coding agent tasks
-│   ├── adapters/           # API adapters: OpenAI, Anthropic
-│   ├── harness/            # Coding agent harnesses: ClaudeCode, Codex (common/base)
-│   └── parsing.py          # Agent output parsing utilities
-│
-├── backends/               # Training & inference backend integrations
-│   ├── megatron_utils/     # Megatron integration: model provider, actor, loss, checkpoint, CP, update_weight/
-│   │   ├── model_provider.py   # Model definition (GPTModel wrapper)
-│   │   ├── actor.py             # Training actor logic (forward/backward, PPO loss)
-│   │   ├── loss.py              # Loss functions (GRPO, PPO, KLOffline, etc.)
-│   │   ├── checkpoint.py        # Checkpoint save/load
-│   │   ├── update_weight/       # Weight sync to SGLang (tensor, disk, disk-delta, distributed)
-│   │   ├── megatron_to_hf/     # Per-model Megatron→HF checkpoint converters
-│   │   └── hf_checkpoint_saver.py
-│   └── sglang_utils/       # SGLang integration: config parsing, engine control
-│
-├── utils/                  # Shared utilities (90k+ lines in arguments.py alone)
-│   ├── arguments.py        # All CLI argument definitions (600+ args)
-│   ├── ppo_utils.py        # PPO math: advantage estimation, loss computation, KL, GAE
-│   ├── types.py            # Core data types: Sample, MultimodalTypes
-│   ├── data.py             # Dataset loading (JSONL, Parquet, JSON), tokenization utils
-│   ├── dp_schedule.py      # Dynamic packing schedule for variable-length sequences
-│   ├── seqlen_balancing.py # Sequence length balancing for efficient packing
-│   ├── mask_utils.py       # Loss mask generation for PPO/GRPO
-│   ├── trace_utils.py      # Trace/tracing integration for observability
-│   ├── tensorboard_utils.py / wandb_utils.py # Experiment tracking
-│   └── external_utils/     # External CLI helpers (typer-based)
-│
-slime_plugins/              # Model-specific bridges and extensions
-├── megatron_bridge/        # Megatron bridge for GLM-4V MoE
-├── mbridge/                # Model bridge configs (GLM, Qwen, DeepSeek, etc.)
-├── models/                 # Model implementations (GLM5, Gemma4, Qwen3, etc.)
-└── rollout_buffer/         # Rollout buffer for experience replay
-```
+- `slime/ray/` — Ray orchestration: RolloutManager, placement groups, train actor groups
+- `slime/rollout/` — Rollout logic: SGLang generation, data sources, RM hub, filter hub
+- `slime/agent/` — Agentic RL harnesses: trajectory management, sandbox execution, API adapters
+- `slime/backends/` — Backend integrations: Megatron (model, loss, checkpoint, weight sync) + SGLang utils
+- `slime/utils/` — Shared utilities: arguments (90k+ lines, 600+ args), PPO math, data loading, packing
+- `slime_plugins/` — Model-specific bridges: mbridge, model implementations, rollout buffer
 
 ### Data Flow (Sync Train Loop)
 
@@ -174,23 +126,11 @@ Each model family follows a consistent pattern:
 
 ### Tests Structure
 
-```
-tests/
-├── test_<model>_<feature>.py    # GPU integration tests (4+ GPUs)
-├── test_qwen2.5_0.5B_short.py   # Minimal smoke test (fastest GPU test)
-├── test_release_train.py         # Full workflow test
-├── test_loss_cp_invariance.py    # Context parallelism loss correctness
-├── test_metric_report.py         # Metric reporting correctness
-├── test_sample.py                # Data sampling correctness
-├── test_chunked_gae.py           # Chunked GAE advantage estimation
-├── test_cispo_loss.py            # CISPO loss
-├── test_ppo_logprob_entropy.py   # PPO logprob/entropy CPU test
-├── test_ppo_logprob_entropy_gpu.py  # PPO logprob/entropy GPU test
-├── test_agent/                   # Agentic RL CPU tests
-├── plugin_contracts/             # Plugin API contract tests
-├── utils/                        # Utility function tests
-└── gemma4/                       # Gemma4-specific tests
-```
+- `tests/test_<model>_<feature>.py` — GPU integration tests (4+ GPUs). Smoke test: `test_qwen2.5_0.5B_short.py`
+- `tests/test_agent/` — Agentic RL CPU tests
+- `tests/plugin_contracts/` — Plugin API contract tests
+- `tests/utils/` — Utility function tests
+- `tests/gemma4/` — Gemma4-specific tests
 
 ### Key Design Patterns
 

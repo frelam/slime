@@ -222,7 +222,8 @@ async def tool_rl_grpo_generate(
                 sampling.get("max_new_tokens", remaining), remaining,
             )
             # Qwen uses <|im_end|> as EOS — SGLang will stop on it
-            if "stop" not in sampling:
+            # slime may pass stop=None, treat it same as missing key
+            if not sampling.get("stop"):
                 sampling["stop"] = ["<|im_end|>"]
 
             resp = await _call_sglang(

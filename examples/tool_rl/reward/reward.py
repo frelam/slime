@@ -136,10 +136,23 @@ async def compute_tool_rl_reward(
     tool_call_score = verifier["tool_call_format"]
 
     # ---- Dim 1 + Dim 4: RM ----
-    rm = await _call_rm(args, trajectory, task_description, ground_truth_label)
-
-    planning_raw = rm["planning_score"]   # 1.0 / 0.6 / 0.3 / -0.2
-    halluc_raw = rm["hallucination_score"]  # 0 or 1
+    # Check for truly garbled output (gibberish / high token repetition)
+    # before calling the RM — early untrained models often produce
+    # repetitive nonsense that the RM (which may use the same SGLang
+    # endpoint) will incorrectly score as reasonable.
+    if _is_garbled_output(trajectory):
+        planning_raw = -0.2
+        halluc_raw = 0
+        rm = {
+            "planning_score": -0.2,
+            "hallucination_score": 0,
+            "planning_reason": "Output is garbled/gibberish — floor score",
+            "hallucination_reason": "Output is garbled/gibberish — floor score",
+        }
+    else:
+        rm = await _call_rm(args, trajectory, task_description, ground_truth_label)
+        planning_raw = rm["planning_score"]   # 1.0 / 0.6 / 0.3 / -0.2
+        halluc_raw = rm["hallucination_score"]  # 0 or 1
 
     # Normalize planning from [-0.2, 1.0] → [0.0, 1.0]
     planning_norm = max(0.0, (planning_raw + 0.2) / 1.2)
@@ -173,6 +186,32 @@ async def compute_tool_rl_reward(
         tool_call_score, halluc_raw,
     )
     return breakdown
+
+
+def _is_garbled_output(trajectory: list[dict[str, Any]]) -> bool:
+    """Heuristic: check if the assistant output is garbled/gibberish.
+
+    Early untrained models often produce repetitive token sequences that the
+    RM (especially when pointing at the same SGLang endpoint) will incorrectly
+    score as reasonable.  We detect this via character and trigram diversity
+    and skip the RM call entirely.
+    """
+    text = " ".join(
+        msg.get("content", "") for msg in trajectory if msg.get("role") == "assistant"
+    )
+    # Strip XML tags to get the raw reasoning/text content
+    text = re.sub(r"<[^>]+>", "", text).strip()
+    if len(text) < 20:
+        return False  # too short to reliably detect
+
+    # Character-set diversity — garbled text reuses very few characters
+    char_diversity = len(set(text)) / max(1, len(text))
+
+    # Trigram diversity — high repetition of 3-char windows
+    trigrams = [text[i : i + 3] for i in range(len(text) - 2)]
+    trigram_diversity = len(set(trigrams)) / len(trigrams) if trigrams else 1.0
+
+    return char_diversity < 0.15 and trigram_diversity < 0.15
 
 
 # ============================================================================
