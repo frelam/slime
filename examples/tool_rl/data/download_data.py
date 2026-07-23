@@ -376,62 +376,101 @@ def load_bfcl(max_samples: int) -> list[dict[str, Any]]:
     return tasks
 
 
+def _extract_bfcl_turns(question: Any) -> list[list[dict]] | None:
+    """Extract turns from BFCL v3 question field.
+
+    BFCL v3 format: ``[[{"role": "user", "content": "..."}], ...]``
+    Each outer element is a turn with one or more messages.
+    Returns list of messages per turn (list of lists of dicts).
+    """
+    if isinstance(question, list) and len(question) > 0:
+        # BFCL v3: list of turns, each turn is a list of messages
+        if isinstance(question[0], list):
+            return question
+        # Some files have list of dicts (single turn)
+        if isinstance(question[0], dict) and "role" in question[0]:
+            return [question]
+    return None
+
+
+def _extract_text_from_bfcl_messages(messages: list) -> str:
+    """Extract user text from BFCL message list."""
+    parts = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                parts.append(content)
+    return "\n".join(parts) if parts else ""
+
+
 def _parse_bfcl(raw: dict, category: str) -> list[dict]:
     """Parse BFCL sample → single-turn samples."""
-    query = raw.get("question") or raw.get("user_query") or raw.get("query") or ""
-    if not query:
-        return []
     funcs = raw.get("function") or raw.get("functions") or []
     if isinstance(funcs, dict):
         funcs = [funcs]
     tools = _normalize_tools(funcs)
-    gt = raw.get("ground_truth") or raw.get("answers") or raw.get("answer") or []
-    if isinstance(gt, dict):
-        gt = [gt]
     tid = raw.get("id", f"bfcl-{category}")
 
-    turns = raw.get("turns") or raw.get("conversation") or []
-    if turns:
-        results = []
-        history = []
-        for ti, turn in enumerate(turns):
-            if not isinstance(turn, dict):
-                continue
-            tq = turn.get("question") or turn.get("user") or turn.get("query") or ""
-            ta = turn.get("answer") or turn.get("assistant") or ""
-            if not tq:
-                continue
-            msgs = [
-                {"role": "system", "content": "You are a helpful assistant with access to tools."},
-            ]
-            for h in history[-8:]:
-                msgs.append(dict(h))
-            msgs.append({"role": "user", "content": tq})
-            msgs = _prepend_instruction(msgs)
-            t_gt = _parse_qwen_tool_calls(ta)
-            results.append({
-                "messages": msgs,
-                "tools": tools,
-                "label": _format_gt(t_gt) + (f"\nReference:\n{ta[:800]}" if ta else ""),
-                "metadata": _make_meta(f"bfcl/{category}", f"{tid}-t{ti}", tools, t_gt,
-                                       bfcl_category=category),
-            })
-            history.append({"role": "user", "content": tq})
-            if ta:
-                history.append({"role": "assistant", "content": ta[:500]})
-        return results
-    else:
-        msgs = _prepend_instruction([
+    # Skip auxiliary files
+    if category.startswith("possible_answer/") or category.startswith("multi_turn_func_doc/"):
+        return []
+
+    turns_data = _extract_bfcl_turns(raw.get("question"))
+    if turns_data is None:
+        return []
+
+    results = []
+    history: list[dict] = []
+
+    for ti, turn_msgs in enumerate(turns_data):
+        if not isinstance(turn_msgs, list):
+            continue
+        query_text = _extract_text_from_bfcl_messages(turn_msgs)
+        if not query_text:
+            continue
+
+        msgs = [
             {"role": "system", "content": "You are a helpful assistant with access to tools."},
-            {"role": "user", "content": query},
-        ])
-        return [{
+        ]
+        for h in history[-8:]:
+            msgs.append(dict(h))
+        msgs.append({"role": "user", "content": query_text})
+        msgs = _prepend_instruction(msgs)
+
+        # Parse ground truth for this turn
+        gt_raw = raw.get("ground_truth") or raw.get("answers") or raw.get("answer") or ""
+        if isinstance(gt_raw, list):
+            gt_str = "\n".join(str(g) for g in gt_raw if g) if gt_raw else ""
+        elif isinstance(gt_raw, str):
+            gt_str = gt_raw
+        else:
+            gt_str = str(gt_raw) if gt_raw else ""
+        if gt_str.strip():
+            gt = _parse_qwen_tool_calls(gt_str)
+        else:
+            gt = []
+
+        results.append({
             "messages": msgs,
             "tools": tools,
-            "label": _format_gt(gt),
-            "metadata": _make_meta(f"bfcl/{category}", str(tid), tools, gt,
-                                   bfcl_category=category),
-        }]
+            "label": _format_gt(gt) + (f"\nReference:\n{gt_str[:800]}" if gt_str.strip() else ""),
+            "metadata": _make_meta(
+                f"bfcl/{category}", f"{tid}-t{ti}", tools, gt,
+                bfcl_category=category,
+            ),
+        })
+
+        # Add to history for multi-turn context
+        history.append({"role": "user", "content": query_text})
+        # Look for assistant response in the same turn
+        for msg in turn_msgs:
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    history.append({"role": "assistant", "content": content[:500]})
+
+    return results
 
 
 # ============================================================================
@@ -441,13 +480,37 @@ def _parse_bfcl(raw: dict, category: str) -> list[dict]:
 def _extract_tools_from_text(text: str) -> list[dict[str, Any]]:
     """Extract tool definitions from system prompt text."""
     tools = []
-    for block in re.findall(r'\{[^{}]*"name"\s*:\s*"[^"]+"[^{}]*\}', text, re.DOTALL):
+    # Try to find the outermost JSON array of tools in the text
+    array_match = re.search(r'\[.*\]', text, re.DOTALL)
+    if array_match:
         try:
-            obj = json.loads(block)
-            if "name" in obj:
-                tools.append(obj)
-        except json.JSONDecodeError:
+            candidates = json.loads(array_match.group(0))
+            if isinstance(candidates, list):
+                for c in candidates:
+                    if isinstance(c, dict) and "name" in c:
+                        tools.append(c)
+        except (json.JSONDecodeError, TypeError):
             pass
+    # Fallback: try extracting individual objects with nested braces
+    if not tools:
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    block = text[start:i+1]
+                    try:
+                        obj = json.loads(block)
+                        if isinstance(obj, dict) and "name" in obj:
+                            tools.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+                    start = -1
     return tools
 
 
