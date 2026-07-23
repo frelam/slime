@@ -267,13 +267,8 @@ async def _call_rm(
                 logger.warning("RM %d/%d: %s", attempt + 1, max_retries + 1, e)
                 await asyncio.sleep(1.0 * (attempt + 1))
 
-    logger.error("RM failed: %s — neutral", last_err)
-    return {
-        "planning_score": 0.5,
-        "hallucination_score": 1.0,
-        "planning_reason": "RM unavailable",
-        "hallucination_reason": "RM unavailable",
-    }
+    logger.error("RM failed after %d retries: %s — aborting sample", max_retries + 1, last_err)
+    raise RuntimeError(f"RM failed: {last_err}")
 
 
 def _parse_rm(text: str) -> dict | None:

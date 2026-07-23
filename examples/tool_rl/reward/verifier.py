@@ -109,16 +109,21 @@ def parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
 # ============================================================================
 
 
-def check_format_compliance(trajectory: list[dict[str, Any]]) -> float:
+def check_format_compliance(
+    trajectory: list[dict[str, Any]],
+    *,
+    available_tools: list[dict[str, Any]] | None = None,
+) -> float:
     """Check <think>...<tool_call> format compliance.
 
     Scoring:
       1. All tool_calls after reasoning content → +0.6
       2. Each tool_call preceded by <think> → +0.4 × count/N
-      3. No tools → 1.0
+      3. No tools → 0.0 if tools are defined, 1.0 if no tools at all
 
     Args:
         trajectory: Normalized trajectory.
+        available_tools: Tool definitions. If non-empty and no calls, score 0.
 
     Returns:
         Score in [0.0, 1.0].
@@ -128,7 +133,10 @@ def check_format_compliance(trajectory: list[dict[str, Any]]) -> float:
     n_calls += len(_TOOL_CALL_JSON_RE.findall(all_text))
 
     if n_calls == 0:
-        logger.debug("[dim2] No tool calls → 1.0")
+        if available_tools:
+            logger.debug("[dim2] No tool calls but tools available → 0.0")
+            return 0.0
+        logger.debug("[dim2] No tool calls, no tools defined → 1.0")
         return 1.0
 
     score = 0.0
@@ -207,11 +215,11 @@ def check_tool_call_format(
       1. Name correct + not undeclared → +1/N × 0.5
       2. Param name correct + not undeclared → +1/N × 0.3
       3. Param type correct → +1/N × 0.2
-      4. No tools → 1.0
+      4. No tools → 0.0 if tools are defined, 1.0 if no tools at all
 
     Args:
         trajectory: Normalized trajectory.
-        available_tools: List of tool defs with ``name``, ``parameters``.
+        available_tools: Tool definitions. If non-empty and no calls, score 0.
 
     Returns:
         Score in [0.0, 1.0].
@@ -220,7 +228,10 @@ def check_tool_call_format(
     parsed = parse_qwen_tool_calls(all_text)
 
     if not parsed:
-        logger.debug("[dim3] No tool calls → 1.0")
+        if available_tools:
+            logger.debug("[dim3] No tool calls but tools available → 0.0")
+            return 0.0
+        logger.debug("[dim3] No tool calls, no tools defined → 1.0")
         return 1.0
 
     n = len(parsed)
@@ -340,6 +351,6 @@ def compute_verifier_scores(
         ``{"format_compliance": float, "tool_call_format": float}``.
     """
     return {
-        "format_compliance": check_format_compliance(trajectory),
+        "format_compliance": check_format_compliance(trajectory, available_tools=available_tools),
         "tool_call_format": check_tool_call_format(trajectory, available_tools),
     }
