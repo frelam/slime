@@ -252,8 +252,8 @@ async def _call_rm(
     user += "Output your evaluation as a JSON object."
 
     # 3. Endpoint
-    rm_type = getattr(args, "rm_model_type", "sglang") or "sglang"
-    endpoint = getattr(args, "rm_model_endpoint", None)
+    rm_type = getattr(args, "rm_model_type", None) or os.environ.get("RM_MODEL_TYPE", "sglang")
+    endpoint = getattr(args, "rm_model_endpoint", None) or os.environ.get("RM_MODEL_ENDPOINT", None)
     if not endpoint:
         ip = getattr(args, "sglang_router_ip", "127.0.0.1")
         port = getattr(args, "sglang_router_port", 30000)
@@ -274,7 +274,7 @@ async def _call_rm(
         api_key = os.environ.get("RM_API_KEY", "")
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        if not getattr(args, "rm_model_endpoint", None):
+        if not (getattr(args, "rm_model_endpoint", None) or os.environ.get("RM_MODEL_ENDPOINT", None)):
             endpoint = "https://api.deepseek.com/v1/chat/completions"
             payload["model"] = "deepseek-chat"
 
