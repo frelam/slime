@@ -244,8 +244,15 @@ def _send_to_colocated_engine(
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         metadata = flattened_tensor_bucket.get_metadata()
+        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+        # Serialization via CUDA IPC (_share_cuda_()) requires the tensor
+        # storage to be contiguous and on the current device.  Non-contiguous
+        # views can trigger "CUDA error: invalid argument" at
+        # torch/multiprocessing/reductions.py reduce_tensor.
+        if not flattened_tensor.is_contiguous():
+            flattened_tensor = flattened_tensor.contiguous()
         flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "flattened_tensor": flattened_tensor,
             "metadata": metadata,
         }
         long_live_tensors.append(flattened_tensor_data)
