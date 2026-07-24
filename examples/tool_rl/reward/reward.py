@@ -1,30 +1,33 @@
-"""Tool RL reward composer — strict 4-dimensions per user spec.
+"""Tool RL reward composer — 3 dimensions with rule-first design.
 
-Dimensions
-----------
-===========  ==============================  ======  ========
-Dim          Name                            Weight  Source
-===========  ==============================  ======  ========
-Dim 1        思考与规划质量 (Planning)           0.40    RM
-Dim 2        回复格式合规 (Format)               0.20    Verifier
-Dim 3        工具调用格式 (Tool Call Format)     0.20    Verifier
-Dim 4        臆想检测 (Hallucination)            0.20    RM
-===========  ==============================  ======  ========
+Reward Dimensions
+-----------------
+==============  ==============================  ======  =============
+Dim             Name                            Weight  Source
+==============  ==============================  ======  =============
+Dim 1           工具调用正确性 (Tool Correctness)  0.60    Label match
+                                                         or RM v2
+Dim 2           回复格式合规 (Format)              0.20    Verifier
+Dim 3           工具调用格式 (Tool Call Format)    0.20    Verifier
+==============  ==============================  ======  =============
 
-Dim 1 — RM scored (planning):
-  优 (Excellent):  1.0 — correct understanding + reasoning + planning + tools
-  良 (Good):       0.6 — correct understanding + planning, wrong tools/deps
-  合格 (Adequate): 0.3 — correct understanding, planning+tool errors
-  差 (Poor):      -0.2 — wrong understanding, no tools when needed, too cautious
+Dim 1 has two modes:
+
+**Label mode** (dataset provides ground truth tool calls):
+  Rule-based matching, order-independent.
+  - Tool name match  → 0.5  (binary per label call)
+  - Param content    → 0.5  (value match per label param)
+
+**RM mode** (no ground truth):
+  LLM judge scores two sub-dimensions, same weights:
+  - Tool name correctness (0.0-1.0)
+  - Parameter content correctness (0.0-1.0)
 
 Dim 2 — Verifier (format):
   0.6 if all tool_calls after reasoning + 0.4 × count/N for think before each call
 
 Dim 3 — Verifier (tool call format):
   1/N × 0.5 name + 1/N × 0.3 param_name + 1/N × 0.2 param_type per call
-
-Dim 4 — RM scored (hallucination):
-  0 = fabricated info, 1 = fact-based / humble
 """
 
 from __future__ import annotations
@@ -45,10 +48,15 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 DEFAULT_WEIGHTS: dict[str, float] = {
-    "planning": 0.40,
+    "tool_correctness": 0.60,  # replaces old planning(0.40) + hallucination(0.20)
     "format": 0.20,
     "tool_call": 0.20,
-    "hallucination": 0.20,
+}
+
+# Backward-compat mapping: old → new dimension keys
+_OLD_TO_NEW: dict[str, str] = {
+    "planning": "tool_correctness",
+    "hallucination": "tool_correctness",
 }
 
 
@@ -68,6 +76,13 @@ def get_weights(args: Any) -> dict[str, float]:
     if not isinstance(raw, dict):
         return defaults
 
+    # Map old dimension keys to new (e.g. planning → tool_correctness)
+    for old_k, new_k in _OLD_TO_NEW.items():
+        if old_k in raw:
+            if new_k not in defaults:
+                defaults[new_k] = 0.0
+            defaults[new_k] += float(raw.pop(old_k))
+
     for k in defaults:
         if k in raw:
             defaults[k] = float(raw[k])
@@ -85,19 +100,22 @@ def get_weights(args: Any) -> dict[str, float]:
 @dataclass
 class ToolRLRewardBreakdown:
     total: float
-    planning: float
-    format_compliance: float
-    tool_call_format: float
-    hallucination: float
+    tool_correctness: float       # 0-1 composite: name 0.5 + param content 0.5
+    name_score: float             # tool name match sub-score
+    param_content_score: float    # parameter content match sub-score
+    format_compliance: float      # Dim 2 — verifier
+    tool_call_format: float       # Dim 3 — verifier
+    source: str = "label"         # "label" or "rm"
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, float]:
         return {
             "reward/total": self.total,
-            "reward/planning": self.planning,
+            "reward/tool_correctness": self.tool_correctness,
+            "reward/name_score": self.name_score,
+            "reward/param_content_score": self.param_content_score,
             "reward/format_compliance": self.format_compliance,
             "reward/tool_call_format": self.tool_call_format,
-            "reward/hallucination": self.hallucination,
         }
 
 
@@ -113,8 +131,23 @@ async def compute_tool_rl_reward(
     *,
     available_tools: list[dict[str, Any]] | None = None,
     ground_truth_label: str = "",
+    ground_truth_calls: list[dict[str, Any]] | None = None,
 ) -> ToolRLRewardBreakdown:
-    """Compute the 4-dim tool RL reward.
+    """Compute the 3-dim tool RL reward.
+
+    Two modes of operation:
+
+    **Label mode** (``ground_truth_calls`` is non-empty):
+      Dim 1 (tool_correctness) is scored by rule-based, order-independent
+      matching of the model's tool calls against the ground truth labels.
+      Tool name match = 0.5, parameter content match = 0.5 within the dim.
+
+    **RM mode** (no ``ground_truth_calls``):
+      Dim 1 is scored by an LLM judge (RM) along the same two sub-dimensions:
+      tool name correctness and parameter content correctness.
+
+    Dim 2 (format) and Dim 3 (tool_call_format) are always rule-based
+    verifiers (see ``verifier.py``).
 
     Args:
         args: Slime training args.
@@ -122,70 +155,104 @@ async def compute_tool_rl_reward(
         task_description: The task prompt (for RM context).
         available_tools: Tool definitions for Dim 3 verification.
         ground_truth_label: Ground truth string (for RM reference).
+        ground_truth_calls: Structured ground truth tool calls
+            (``[{"name": …, "arguments": {…}}]``) for rule-based matching.
 
     Returns:
-        ``ToolRLRewardBreakdown`` with all 4 dimension scores.
+        ``ToolRLRewardBreakdown`` with all dimension scores.
     """
-    from examples.tool_rl.reward.verifier import compute_verifier_scores
+    from examples.tool_rl.reward.verifier import (
+        compute_verifier_scores,
+        match_tool_calls_against_label,
+        parse_ground_truth_calls,
+        parse_qwen_tool_calls,
+    )
 
     weights = get_weights(args)
 
-    # ---- Dim 2 + Dim 3: Verifier ----
+    # ── Dim 2 + Dim 3: Verifier (rule-based, always on) ──
     verifier = compute_verifier_scores(trajectory, available_tools=available_tools)
     format_score = verifier["format_compliance"]
     tool_call_score = verifier["tool_call_format"]
 
-    # ---- Dim 1 + Dim 4: RM ----
-    # Check for truly garbled output (gibberish / high token repetition)
-    # before calling the RM — early untrained models often produce
-    # repetitive nonsense that the RM (which may use the same SGLang
-    # endpoint) will incorrectly score as reasonable.
-    if _is_garbled_output(trajectory):
-        planning_raw = -0.2
-        halluc_raw = 0
-        rm = {
-            "planning_score": -0.2,
-            "hallucination_score": 0,
-            "planning_reason": "Output is garbled/gibberish — floor score",
-            "hallucination_reason": "Output is garbled/gibberish — floor score",
+    # Parse the model's tool calls from trajectory text
+    all_text = _get_agent_text(trajectory)
+    output_calls = parse_qwen_tool_calls(all_text)
+
+    # ── Dim 1: Tool Call Correctness ────────────────────
+    parsed_gt = parse_ground_truth_calls(ground_truth_calls)
+
+    if parsed_gt:
+        # ── Label mode: rule-based matching ──
+        source = "label"
+        name_score, param_score = match_tool_calls_against_label(
+            output_calls, parsed_gt,
+        )
+        tool_correctness = 0.5 * name_score + 0.5 * param_score
+
+        details: dict[str, Any] = {
+            "source": "label",
+            "n_label_calls": len(parsed_gt),
+            "n_output_calls": len(output_calls),
         }
     else:
-        rm = await _call_rm(args, trajectory, task_description, ground_truth_label)
-        planning_raw = rm["planning_score"]   # 1.0 / 0.6 / 0.3 / -0.2
-        halluc_raw = rm["hallucination_score"]  # 0 or 1
+        # ── RM mode: LLM judge (structured 2-dim scoring) ──
+        source = "rm"
+        if _is_garbled_output(trajectory):
+            name_score = 0.0
+            param_score = 0.0
+            tool_correctness = 0.0
+            details = {
+                "source": "rm",
+                "name_reason": "Output is garbled — floor score",
+                "param_reason": "Output is garbled — floor score",
+            }
+        else:
+            rm = await _call_rm_v2(
+                args, trajectory, task_description, ground_truth_label,
+            )
+            name_score = rm["tool_name_score"]
+            param_score = rm["param_content_score"]
+            tool_correctness = 0.5 * name_score + 0.5 * param_score
+            details = {
+                "source": "rm",
+                "name_reason": rm.get("name_reason", ""),
+                "param_reason": rm.get("param_reason", ""),
+            }
 
-    # Normalize planning from [-0.2, 1.0] → [0.0, 1.0]
-    planning_norm = max(0.0, (planning_raw + 0.2) / 1.2)
-
-    # ---- Weighted sum ----
+    # ── Weighted sum ────────────────────────────────────
     total = (
-        weights["planning"] * planning_norm
+        weights["tool_correctness"] * tool_correctness
         + weights["format"] * format_score
         + weights["tool_call"] * tool_call_score
-        + weights["hallucination"] * halluc_raw
     )
     total = max(0.0, min(1.0, total))
 
     breakdown = ToolRLRewardBreakdown(
         total=total,
-        planning=planning_raw,
+        tool_correctness=tool_correctness,
+        name_score=name_score,
+        param_content_score=param_score,
         format_compliance=format_score,
         tool_call_format=tool_call_score,
-        hallucination=halluc_raw,
-        details={
-            "weights": weights,
-            "planning_reason": rm.get("planning_reason", ""),
-            "hallucination_reason": rm.get("hallucination_reason", ""),
-        },
+        source=source,
+        details=details,
     )
 
     logger.info(
-        "Tool RL: total=%.3f planning=%.1f(n=%.3f) format=%.3f "
-        "tool_call=%.3f halluc=%.0f",
-        total, planning_raw, planning_norm, format_score,
-        tool_call_score, halluc_raw,
+        "Tool RL: total=%.3f correctness=%.3f(name=%.3f+param=%.3f) "
+        "format=%.3f tool_call=%.3f src=%s",
+        total, tool_correctness, name_score, param_score,
+        format_score, tool_call_score, source,
     )
     return breakdown
+
+
+def _get_agent_text(trajectory: list[dict[str, Any]]) -> str:
+    """Extract assistant-generated text from a trajectory."""
+    return "\n".join(
+        r.get("text", "") for r in trajectory if r.get("type") != "observation"
+    )
 
 
 def _is_garbled_output(trajectory: list[dict[str, Any]]) -> bool:
@@ -219,7 +286,7 @@ def _is_garbled_output(trajectory: list[dict[str, Any]]) -> bool:
 # ============================================================================
 
 
-async def _call_rm(
+async def _call_rm_v2(
     args: Any,
     trajectory: list[dict[str, Any]],
     task_description: str,
@@ -227,9 +294,19 @@ async def _call_rm(
     *,
     max_retries: int = 2,
 ) -> dict[str, Any]:
-    """Call RM for planning (Dim 1) + hallucination (Dim 4) scores.
+    """Call RM for tool name + param content scoring (structured 2-dim).
+
+    The RM evaluates two clear sub-dimensions:
+      1. Tool name correctness (0.0-1.0): whether the right tools were
+         selected for the task.
+      2. Parameter content correctness (0.0-1.0): whether parameter
+         values are reasonable / not fabricated.
 
     API key from ``RM_API_KEY`` env var (never CLI).
+
+    Returns:
+        ``{"tool_name_score": float, "param_content_score": float,
+          "name_reason": str, "param_reason": str}``
     """
     import aiohttp
     import asyncio
@@ -293,11 +370,11 @@ async def _call_rm(
                     data = await resp.json()
                     content = (data.get("choices", [{}])[0]
                                .get("message", {}).get("content", ""))
-                    result = _parse_rm(content)
+                    result = _parse_rm_v2(content)
                     if result:
-                        logger.info("RM: planning=%.1f halluc=%.0f",
-                                    result["planning_score"],
-                                    result["hallucination_score"])
+                        logger.info("RMv2: name=%.3f param=%.3f",
+                                    result["tool_name_score"],
+                                    result["param_content_score"])
                         return result
                     last_err = f"parse: {content[:200]}"
         except Exception as e:
@@ -310,16 +387,22 @@ async def _call_rm(
     raise RuntimeError(f"RM failed: {last_err}")
 
 
-def _parse_rm(text: str) -> dict | None:
-    """Parse RM JSON response."""
+def _parse_rm_v2(text: str) -> dict | None:
+    """Parse RM v2 JSON response.
+
+    Expected format::
+
+        {"tool_name_score": 0.8, "param_content_score": 0.6,
+         "name_reason": "...", "param_reason": "..."}
+    """
     text = text.strip()
-    cands = []
+    cands: list[str] = []
     if text.startswith("{"):
         cands.append(text)
     for m in re.finditer(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL):
         cands.append(m.group(1).strip())
     for m in re.finditer(
-        r'\{[^{}]*"planning_score"[^{}]*"hallucination_score"[^{}]*\}',
+        r'\{[^{}]*"tool_name_score"[^{}]*(?"param_content_score"[^{}]*)*\}',
         text, re.DOTALL,
     ):
         cands.append(m.group(0))
@@ -331,14 +414,14 @@ def _parse_rm(text: str) -> dict | None:
             continue
         if not isinstance(obj, dict):
             continue
-        if "planning_score" in obj:
+        if "tool_name_score" in obj:
             return {
-                "planning_score": float(obj.get("planning_score", 0.5)),
-                "hallucination_score": float(obj.get("hallucination_score", 1.0)),
-                "planning_reason": str(obj.get("planning_reason", "")),
-                "hallucination_reason": str(obj.get("hallucination_reason", "")),
+                "tool_name_score": max(0.0, min(1.0, float(obj.get("tool_name_score", 0.5)))),
+                "param_content_score": max(0.0, min(1.0, float(obj.get("param_content_score", 0.5)))),
+                "name_reason": str(obj.get("name_reason", "")),
+                "param_reason": str(obj.get("param_reason", "")),
             }
-    logger.warning("Could not parse RM: %r", text[:500])
+    logger.warning("Could not parse RMv2: %r", text[:500])
     return None
 
 
@@ -361,9 +444,13 @@ def _load_prompt(task_type: str, prompt_dir: str) -> str:
     fallback = (
         "You are an expert evaluator for AI agent tool-use trajectories.\n\n"
         "Evaluate on two dimensions:\n"
-        "1. Planning Score: 1.0/0.6/0.3/-0.2\n"
-        "2. Hallucination Score: 0 (fabricated) / 1 (fact-based)\n\n"
-        'Respond ONLY with JSON: {"planning_score": <float>, "hallucination_score": <0|1>, "planning_reason": "...", "hallucination_reason": "..."}'
+        "1. Tool Name Correctness (0.0-1.0): Did the agent select the correct "
+        "tools for the task? 1.0 = perfectly appropriate, 0.0 = completely wrong.\n"
+        "2. Parameter Content Correctness (0.0-1.0): Are the parameter values "
+        "reasonable and correct? Penalize fabrication / hallucination.\n\n"
+        'Respond ONLY with JSON: {"tool_name_score": <float>, '
+        '"param_content_score": <float>, '
+        '"name_reason": "...", "param_reason": "..."}'
     )
     _prompt_cache[cache_key] = fallback
     return fallback
@@ -423,11 +510,13 @@ def _extract_reward(sample: Any) -> float:
         tools = metadata.get("tools", [])
         desc = sample.prompt if isinstance(sample.prompt, str) else ""
         gt_label = sample.label or ""
+        gt_calls = metadata.get("ground_truth", None)
         bd = asyncio.run(
             compute_tool_rl_reward(
                 None, traj, desc,
                 available_tools=tools,
                 ground_truth_label=gt_label,
+                ground_truth_calls=gt_calls,
             )
         )
         return bd.total

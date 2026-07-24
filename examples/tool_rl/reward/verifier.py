@@ -464,6 +464,159 @@ def get_incorrect_tool_call_spans(
 # ============================================================================
 
 
+# ============================================================================
+# Label-based tool call correctness matching (for ground-truth-labeled data)
+# ============================================================================
+#
+# When the dataset provides ground-truth tool call labels, we match the
+# model output against them with order-independent (bipartite) matching.
+#
+# Scoring per sample (within the tool_correctness dimension):
+#   - Tool name match    → 0.5  (binary: matched or not, per label call)
+#   - Parameter content  → 0.5  (fractional: how well param values match)
+#
+# Multiple tool calls in the output are matched to label calls by tool name
+# first, then by best param similarity — order is irrelevant.
+
+
+def _values_match(v1: Any, v2: Any) -> bool:
+    """Check value equality with some fuzziness for strings."""
+    if v1 is v2 or type(v1) == type(v2) and v1 == v2:
+        return True
+    if v1 is None or v2 is None:
+        return False
+    if isinstance(v1, str) and isinstance(v2, str):
+        return v1.strip().lower() == v2.strip().lower()
+    if isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+        return abs(float(v1) - float(v2)) < 1e-6
+    if isinstance(v1, dict) and isinstance(v2, dict):
+        return v1.keys() == v2.keys() and all(_values_match(v1[k], v2[k]) for k in v1)
+    if isinstance(v1, list) and isinstance(v2, list) and len(v1) == len(v2):
+        return all(_values_match(a, b) for a, b in zip(v1, v2))
+    return False
+
+
+def _param_content_score(
+    label_args: dict[str, Any],
+    output_args: dict[str, Any],
+) -> float:
+    """Score how well output parameter values match ground truth.
+
+    Returns a score in [0, 1]:
+      - Fraction of label params whose values match the output.
+      - Extra output params (not in label) incur a 50 % penalty on the
+        remainder so that spurious parameters don't go free.
+    """
+    if not label_args and not output_args:
+        return 1.0
+    if not label_args:
+        return 1.0  # tool expects no params, none given
+
+    correct = sum(
+        1 for k, lv in label_args.items()
+        if k in output_args and _values_match(lv, output_args[k])
+    )
+    # Penalty for extra/undeclared params in output
+    extra = sum(1 for k in output_args if k not in label_args)
+    penalty = 0.5 * extra / max(len(label_args) + extra, 1)
+    return max(0.0, correct / len(label_args) - penalty)
+
+
+def match_tool_calls_against_label(
+    output_calls: list[dict[str, Any]],
+    label_calls: list[dict[str, Any]],
+) -> tuple[float, float]:
+    """Order-independent matching of tool calls against ground truth labels.
+
+    For each *label* call we search for the best-matching *output* call by
+    tool name; among calls with the same name, we pick the one with the
+    highest parameter-content score.  Once matched, a label call consumes
+    that output call (no reuse).
+
+    Args:
+        output_calls: Parsed tool calls from the model output
+            (``[{"name": …, "arguments": {…}}]``).
+        label_calls: Ground truth tool calls from the dataset
+            (``[{"name": …, "arguments": {…}}]``).
+
+    Returns:
+        Tuple ``(name_score, param_score)`` each in ``[0.0, 1.0]``.
+    """
+    if not label_calls:
+        # Label says "no tools needed"
+        return (1.0, 1.0) if not output_calls else (0.0, 0.0)
+
+    matched_indices: set[int] = set()
+    pair_param_scores: list[float] = []
+
+    for l_call in label_calls:
+        l_name = l_call.get("name", "")
+        l_args = l_call.get("arguments", {}) or {}
+        best_param_score = 0.0
+        best_idx = -1
+
+        for oi, o_call in enumerate(output_calls):
+            if oi in matched_indices:
+                continue
+            if o_call.get("name", "") != l_name:
+                continue
+            o_args = o_call.get("arguments", {}) or {}
+            ps = _param_content_score(l_args, o_args)
+            if ps > best_param_score:
+                best_param_score = ps
+                best_idx = oi
+
+        if best_idx >= 0:
+            matched_indices.add(best_idx)
+            pair_param_scores.append(best_param_score)
+
+    matched = len(pair_param_scores)
+    total = len(label_calls)
+    name_score = matched / total
+    param_score = sum(pair_param_scores) / total if total > 0 else 1.0
+
+    return (name_score, param_score)
+
+
+def parse_ground_truth_calls(
+    ground_truth: Any,
+) -> list[dict[str, Any]]:
+    """Normalise ground truth into ``[{"name": …, "arguments": {…}}]``.
+
+    Handles formats from various data sources:
+      - ``list[dict]`` with "name"/"arguments" keys (the canonical format).
+      - A JSON string containing such a list.
+      - A single dict (one tool call).
+    """
+    if not ground_truth:
+        return []
+    if isinstance(ground_truth, str):
+        try:
+            ground_truth = json.loads(ground_truth)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if isinstance(ground_truth, dict):
+        if "name" in ground_truth:
+            ground_truth = [ground_truth]
+        else:
+            return []
+    if not isinstance(ground_truth, list):
+        return []
+
+    normalised: list[dict[str, Any]] = []
+    for item in ground_truth:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("function", "")
+        if not name:
+            continue
+        args = item.get("arguments") or item.get("parameters") or {}
+        if not isinstance(args, dict):
+            args = {}
+        normalised.append({"name": str(name), "arguments": args})
+    return normalised
+
+
 def compute_verifier_scores(
     trajectory: list[dict[str, Any]],
     *,

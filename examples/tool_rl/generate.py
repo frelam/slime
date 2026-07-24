@@ -16,11 +16,11 @@ Flow (single-turn)
 2. Single SGLang generate → model outputs ``<think>...</think>``
    followed by ``<tool_call>...</tool_call>`` (Qwen XML format).
 3. Parse response into pseudo-trajectory for verifier/RM consumption.
-4. Call ``compute_tool_rl_reward()`` → 4-dim weighted reward:
-   - Dim 1 (0.40): Planning — RM scored (优/良/合格/差)
+4. Call ``compute_tool_rl_reward()`` → 3-dim weighted reward:
+   - Dim 1 (0.60): Tool Correctness — label-based rule match
+     (name 0.5 + param content 0.5) or RM v2 scoring
    - Dim 2 (0.20): Format — Verifier (<think> + <tool_call> format)
-   - Dim 3 (0.20): Tool Call — Verifier (name + param name + param type)
-   - Dim 4 (0.20): Hallucination — RM scored (0/1)
+   - Dim 3 (0.20): Tool Call Format — Verifier (name + param name + param type)
 5. Return ``list[Sample]`` with logprobs + reward.
 """
 
@@ -241,8 +241,12 @@ async def tool_rl_grpo_generate(
             # 3. Build trajectory
             trajectory = _response_to_trajectory(output_text)
 
-            # 4. Compute 4-dim reward
+            # 4. Compute 3-dim reward (label-based or RM)
             ground_truth_label = sample.label or ""
+            ground_truth_calls = (
+                sample.metadata.get("ground_truth", None)
+                if sample.metadata else None
+            )
 
             from examples.tool_rl.reward.reward import (
                 compute_tool_rl_reward,
@@ -252,6 +256,7 @@ async def tool_rl_grpo_generate(
                 args, trajectory, prompt_text,
                 available_tools=available_tools,
                 ground_truth_label=ground_truth_label,
+                ground_truth_calls=ground_truth_calls,
             )
             reward = breakdown.total
 
@@ -292,11 +297,12 @@ async def tool_rl_grpo_generate(
             )
 
             logger.info(
-                "[tool_rl] %s: reward=%.3f planning=%.1f format=%.3f "
-                "tool_call=%.3f halluc=%.0f len=%d %.1fs",
-                task_id, reward, breakdown.planning,
+                "[tool_rl] %s: reward=%.3f correctness=%.3f(name=%.3f+param=%.3f) "
+                "format=%.3f tool_call=%.3f src=%s len=%d %.1fs",
+                task_id, reward, breakdown.tool_correctness,
+                breakdown.name_score, breakdown.param_content_score,
                 breakdown.format_compliance, breakdown.tool_call_format,
-                breakdown.hallucination, response_len, time.time() - t0,
+                breakdown.source, response_len, time.time() - t0,
             )
 
             if evaluation:
