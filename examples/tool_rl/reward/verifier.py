@@ -552,7 +552,7 @@ def match_tool_calls_against_label(
     for l_call in label_calls:
         l_name = l_call.get("name", "")
         l_args = l_call.get("arguments", {}) or {}
-        best_param_score = 0.0
+        best_param_score = -1.0  # start below 0 so even zero-param matches count
         best_idx = -1
 
         for oi, o_call in enumerate(output_calls):

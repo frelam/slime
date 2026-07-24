@@ -77,15 +77,22 @@ def get_weights(args: Any) -> dict[str, float]:
         return defaults
 
     # Map old dimension keys to new (e.g. planning → tool_correctness)
-    for old_k, new_k in _OLD_TO_NEW.items():
-        if old_k in raw:
-            if new_k not in defaults:
-                defaults[new_k] = 0.0
-            defaults[new_k] += float(raw.pop(old_k))
+    has_old_keys = any(k in _OLD_TO_NEW for k in raw)
+
+    if has_old_keys:
+        # Reset defaults and accumulate from raw (old + new keys)
+        for k in list(defaults):
+            defaults[k] = 0.0
+        for old_k, new_k in _OLD_TO_NEW.items():
+            if old_k in raw:
+                if new_k not in defaults:
+                    defaults[new_k] = 0.0
+                defaults[new_k] += float(raw.pop(old_k))
 
     for k in defaults:
         if k in raw:
             defaults[k] = float(raw[k])
+
     total = sum(defaults.values())
     if total > 0:
         defaults = {k: v / total for k, v in defaults.items()}

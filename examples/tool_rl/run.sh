@@ -7,10 +7,10 @@
 # Designed for datasets: APIGen, ToolACE, Hammer, BFCL.
 #
 # Reward dimensions:
-#   Dim 1 (0.40): Planning & reasoning quality  — RM scored
+#   Dim 1 (0.60): Tool call correctness          — Label match (rule-based)
+#                                                  or RM v2 (structured)
 #   Dim 2 (0.20): Format compliance              — Verifier (rule-based)
 #   Dim 3 (0.20): Tool call format correctness   — Verifier (rule-based)
-#   Dim 4 (0.20): Hallucination detection        — RM scored
 #
 # Architecture (colocate + release-train):
 #   Phase 1: [Megatron] train → release → free
@@ -34,7 +34,7 @@
 #
 #   # 5. Custom reward weights:
 #   bash examples/tool_rl/run.sh \
-#       --reward-weights '{"planning":0.5,"format":0.15,"tool_call":0.15,"hallucination":0.2}'
+#       --reward-weights '{"tool_correctness":0.5,"format":0.25,"tool_call":0.25}'
 #
 #   # 6. Use specific RM (DeepSeek API):
 #   RM_MODEL_TYPE=deepseek RM_API_KEY=sk-xxx \
@@ -147,7 +147,7 @@ echo "  Max turns:        ${AGENT_MAX_TURNS}"
 echo "  Mock mode:        ${TOOL_RL_MOCK_MODE}"
 echo "  Data:             ${PROMPT_DATA}"
 echo "  RM type:          ${RM_MODEL_TYPE}"
-echo "  Reward:           4-dim (planning + format + tool_call + hallucination)"
+echo "  Reward:           3-dim (tool_correctness + format + tool_call)"
 echo "  KL loss:          coef=${KL_COEF}, type=${KL_LOSS_TYPE}"
 echo "  Dynamic sampling: ${DYNAMIC_SAMPLING} (filter=${DYNAMIC_SAMPLING_FILTER##*.})"
 echo "============================================"
