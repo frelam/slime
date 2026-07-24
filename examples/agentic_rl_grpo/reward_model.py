@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -207,19 +208,20 @@ async def call_reward_model(
 
     formatted_traj = format_for_rm(trajectory, task_description)
 
+    # Sanitize text to prevent HTTP protocol errors from control characters
+    # (e.g. null bytes, surrogates) that confuse uvicorn's httptools parser.
+    system_prompt = _sanitize_text(system_prompt)
+    formatted_traj = _sanitize_text(formatted_traj)
+
     messages = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
-            "content": (
-                "Please evaluate the following agent trajectory:\n\n"
-                + formatted_traj
-                + "\n\nOutput your evaluation as a JSON object."
-            ),
+            "content": ("Please evaluate the following agent trajectory:\n\n" + formatted_traj + "\n\nOutput your evaluation as a JSON object."),
         },
     ]
 
-    # 3. Resolve endpoint
+    # 3. Resolve endpoint & model name
     rm_type = getattr(args, "rm_model_type", "sglang") or "sglang"
     endpoint = getattr(args, "rm_model_endpoint", None)
 
@@ -228,8 +230,12 @@ async def call_reward_model(
         router_port = getattr(args, "sglang_router_port", 30000)
         endpoint = f"http://{router_ip}:{router_port}/v1/chat/completions"
 
+    # Resolve model name — required by OpenAI /v1/chat/completions spec
+    model_name = _resolve_model_name(args, rm_type)
+
     # 4. Build payload
     payload: dict[str, Any] = {
+        "model": model_name,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -259,15 +265,9 @@ async def call_reward_model(
                 ) as resp:
                     if resp.status != 200:
                         text = await resp.text()
-                        raise RuntimeError(
-                            f"RM API returned {resp.status}: {text[:300]}"
-                        )
+                        raise RuntimeError(f"RM API returned {resp.status}: {text[:300]}")
                     data = await resp.json()
-                    content = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "")
-                    )
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                     result = parse_rm_response(content)
                     if result is not None:
                         logger.info(
@@ -298,3 +298,35 @@ async def call_reward_model(
         last_error,
     )
     return RMResult.neutral()
+
+
+# ---------------------------------------------------------------------------
+# HTTP request helpers
+# ---------------------------------------------------------------------------
+
+_SANITIZE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _sanitize_text(text: str) -> str:
+    """Remove control characters and surrogates that confuse HTTP parsers."""
+    text = _SANITIZE_RE.sub("", text)
+    text = _SURROGATE_RE.sub("", text)
+    return text
+
+
+def _resolve_model_name(args: Any, rm_type: str) -> str:
+    """Resolve the ``model`` field for /v1/chat/completions payload.
+
+    Resolution order: --rm-model-name CLI arg → RM_MODEL_NAME env var
+    → per-type fallback.
+    """
+    model_name = getattr(args, "rm_model_name", None) if args else None
+    if model_name:
+        return model_name
+    model_name = os.environ.get("RM_MODEL_NAME", "")
+    if model_name:
+        return model_name
+    if rm_type == "deepseek":
+        return "deepseek-chat"
+    return "default"

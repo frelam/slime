@@ -1459,6 +1459,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rm-model-name",
+                type=str,
+                default=None,
+                help=(
+                    "Model name to send in the OpenAI-compatible /v1/chat/completions "
+                    "request. Required by the OpenAI API spec. "
+                    "Defaults to the RM_MODEL_NAME env var, "
+                    "or 'default' for SGLang (single-model servers accept any name), "
+                    "or 'deepseek-chat' for DeepSeek."
+                ),
+            )
+            parser.add_argument(
                 "--rm-api-key",
                 type=str,
                 default=None,

@@ -107,12 +107,12 @@ def get_weights(args: Any) -> dict[str, float]:
 @dataclass
 class ToolRLRewardBreakdown:
     total: float
-    tool_correctness: float       # 0-1 composite: name 0.5 + param content 0.5
-    name_score: float             # tool name match sub-score
-    param_content_score: float    # parameter content match sub-score
-    format_compliance: float      # Dim 2 — verifier
-    tool_call_format: float       # Dim 3 — verifier
-    source: str = "label"         # "label" or "rm"
+    tool_correctness: float  # 0-1 composite: name 0.5 + param content 0.5
+    name_score: float  # tool name match sub-score
+    param_content_score: float  # parameter content match sub-score
+    format_compliance: float  # Dim 2 — verifier
+    tool_call_format: float  # Dim 3 — verifier
+    source: str = "label"  # "label" or "rm"
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, float]:
@@ -193,7 +193,8 @@ async def compute_tool_rl_reward(
         # ── Label mode: rule-based matching ──
         source = "label"
         name_score, param_score = match_tool_calls_against_label(
-            output_calls, parsed_gt,
+            output_calls,
+            parsed_gt,
         )
         tool_correctness = 0.5 * name_score + 0.5 * param_score
 
@@ -216,7 +217,10 @@ async def compute_tool_rl_reward(
             }
         else:
             rm = await _call_rm_v2(
-                args, trajectory, task_description, ground_truth_label,
+                args,
+                trajectory,
+                task_description,
+                ground_truth_label,
             )
             name_score = rm["tool_name_score"]
             param_score = rm["param_content_score"]
@@ -228,11 +232,7 @@ async def compute_tool_rl_reward(
             }
 
     # ── Weighted sum ────────────────────────────────────
-    total = (
-        weights["tool_correctness"] * tool_correctness
-        + weights["format"] * format_score
-        + weights["tool_call"] * tool_call_score
-    )
+    total = weights["tool_correctness"] * tool_correctness + weights["format"] * format_score + weights["tool_call"] * tool_call_score
     total = max(0.0, min(1.0, total))
 
     breakdown = ToolRLRewardBreakdown(
@@ -247,19 +247,21 @@ async def compute_tool_rl_reward(
     )
 
     logger.info(
-        "Tool RL: total=%.3f correctness=%.3f(name=%.3f+param=%.3f) "
-        "format=%.3f tool_call=%.3f src=%s",
-        total, tool_correctness, name_score, param_score,
-        format_score, tool_call_score, source,
+        "Tool RL: total=%.3f correctness=%.3f(name=%.3f+param=%.3f) format=%.3f tool_call=%.3f src=%s",
+        total,
+        tool_correctness,
+        name_score,
+        param_score,
+        format_score,
+        tool_call_score,
+        source,
     )
     return breakdown
 
 
 def _get_agent_text(trajectory: list[dict[str, Any]]) -> str:
     """Extract assistant-generated text from a trajectory."""
-    return "\n".join(
-        r.get("text", "") for r in trajectory if r.get("type") != "observation"
-    )
+    return "\n".join(r.get("text", "") for r in trajectory if r.get("type") != "observation")
 
 
 def _is_garbled_output(trajectory: list[dict[str, Any]]) -> bool:
@@ -325,23 +327,24 @@ async def _call_rm_v2(
     import asyncio
 
     # 1. System prompt
-    prompt_dir = getattr(args, "rm_system_prompt_dir",
-                         "examples/tool_rl/reward/prompts")
+    prompt_dir = getattr(args, "rm_system_prompt_dir", "examples/tool_rl/reward/prompts")
     system_prompt = _load_prompt("tool_rl", prompt_dir)
 
     # 2. User message
     traj_text = _format_traj(trajectory)
-    user = (
-        "## Task Description\n\n"
-        f"{task_description[:5000]}\n\n"
-        "## Agent Trajectory\n\n"
-        f"{traj_text}\n\n"
-    )
+    user = f"## Task Description\n\n{task_description[:5000]}\n\n## Agent Trajectory\n\n{traj_text}\n\n"
     if ground_truth_label:
         user += f"## Ground Truth (Reference)\n\n{ground_truth_label[:2000]}\n\n"
     user += "Output your evaluation as a JSON object."
 
-    # 3. Endpoint
+    # Sanitize text content to prevent HTTP protocol errors.
+    # Model outputs can contain control characters (e.g. null bytes,
+    # surrogate pairs) that confuse uvicorn's HTTP parser (httptools),
+    # triggering "Invalid HTTP request received" warnings.
+    system_prompt = _sanitize_text(system_prompt)
+    user = _sanitize_text(user)
+
+    # 3. Endpoint & model name
     rm_type = getattr(args, "rm_model_type", None) or os.environ.get("RM_MODEL_TYPE", "sglang")
     endpoint = getattr(args, "rm_model_endpoint", None) or os.environ.get("RM_MODEL_ENDPOINT", None)
     if not endpoint:
@@ -349,7 +352,13 @@ async def _call_rm_v2(
         port = getattr(args, "sglang_router_port", 30000)
         endpoint = f"http://{ip}:{port}/v1/chat/completions"
 
+    # Resolve model name — required by OpenAI /v1/chat/completions spec.
+    # Without it, SGLang rejects the request (Pydantic ValidationError → 400),
+    # and uvicorn may log "Invalid HTTP request received" for certain payloads.
+    model_name = _resolve_model_name(args, rm_type)
+
     payload: dict[str, Any] = {
+        "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user},
@@ -374,20 +383,19 @@ async def _call_rm_v2(
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(
-                    endpoint, json=payload, headers=headers,
+                    endpoint,
+                    json=payload,
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=120),
                 ) as resp:
                     if resp.status != 200:
                         t = await resp.text()
                         raise RuntimeError(f"RM {resp.status}: {t[:300]}")
                     data = await resp.json()
-                    content = (data.get("choices", [{}])[0]
-                               .get("message", {}).get("content", ""))
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                     result = _parse_rm_v2(content)
                     if result:
-                        logger.info("RMv2: name=%.3f param=%.3f",
-                                    result["tool_name_score"],
-                                    result["param_content_score"])
+                        logger.info("RMv2: name=%.3f param=%.3f", result["tool_name_score"], result["param_content_score"])
                         return result
                     last_err = f"parse: {content[:200]}"
         except Exception as e:
@@ -417,14 +425,15 @@ def _parse_rm_v2(text: str) -> dict | None:
     # Third fallback: try to find JSON-like substring containing both keys
     # (no regex compilation risk)
     for m in re.finditer(
-        r'tool_name_score', text,
+        r"tool_name_score",
+        text,
     ):
         # Find the nearest enclosing { } block
         idx = m.start()
         open_brace = text.rfind("{", 0, idx)
         close_brace = text.find("}", idx)
         if open_brace >= 0 and close_brace > open_brace:
-            cands.append(text[open_brace:close_brace + 1])
+            cands.append(text[open_brace : close_brace + 1])
 
     for c in cands:
         try:
@@ -491,6 +500,47 @@ def _format_traj(trajectory: list[dict]) -> str:
     return "\n".join(parts) if parts else "(empty)"
 
 
+_SANITIZE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+# Surrogate range — json.dumps escapes these, but raw surrogates from model
+# output can still end up in our Python strings and cause issues.
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _sanitize_text(text: str) -> str:
+    """Remove control characters and surrogates that can confuse HTTP parsers.
+
+    uvicorn's httptools-based HTTP parser raises ``HttpParserError``
+    ("Invalid HTTP request received") when encountering certain control
+    characters in the request body, even within JSON strings.  Stripping
+    them prevents protocol-level rejections before the request reaches
+    the SGLang chat completions handler.
+    """
+    text = _SANITIZE_RE.sub("", text)
+    text = _SURROGATE_RE.sub("", text)
+    return text
+
+
+def _resolve_model_name(args: Any, rm_type: str) -> str:
+    """Resolve the ``model`` field for the /v1/chat/completions payload.
+
+    Resolution order:
+    1. ``--rm-model-name`` CLI arg
+    2. ``RM_MODEL_NAME`` env var
+    3. Per-type fallback: ``"deepseek-chat"`` for deepseek, ``"default"``
+       for sglang (single-model servers accept any model name).
+    """
+    model_name = getattr(args, "rm_model_name", None) if args else None
+    if model_name:
+        return model_name
+    model_name = os.environ.get("RM_MODEL_NAME", "")
+    if model_name:
+        return model_name
+    if rm_type == "deepseek":
+        return "deepseek-chat"
+    return "default"
+
+
 # ============================================================================
 # --custom-rm-path adapter
 # ============================================================================
@@ -532,7 +582,9 @@ def _extract_reward(sample: Any) -> float:
         gt_calls = metadata.get("ground_truth", None)
         bd = asyncio.run(
             compute_tool_rl_reward(
-                None, traj, desc,
+                None,
+                traj,
+                desc,
                 available_tools=tools,
                 ground_truth_label=gt_label,
                 ground_truth_calls=gt_calls,
