@@ -528,10 +528,16 @@ def match_tool_calls_against_label(
 ) -> tuple[float, float]:
     """Order-independent matching of tool calls against ground truth labels.
 
-    For each *label* call we search for the best-matching *output* call by
-    tool name; among calls with the same name, we pick the one with the
-    highest parameter-content score.  Once matched, a label call consumes
-    that output call (no reuse).
+    Scoring uses **Jaccard-like** normalisation so both missed tools and
+    extra/spurious calls are penalised:
+
+        name_score   = matched / (M + N - matched)
+        param_score = sum(matched_pair_scores) / (M + N - matched)
+
+    where
+        M = len(output_calls)
+        N = len(label_calls)
+        matched = number of label calls that found a partner by tool name.
 
     Args:
         output_calls: Parsed tool calls from the model output
@@ -571,9 +577,15 @@ def match_tool_calls_against_label(
             pair_param_scores.append(best_param_score)
 
     matched = len(pair_param_scores)
-    total = len(label_calls)
-    name_score = matched / total
-    param_score = sum(pair_param_scores) / total if total > 0 else 1.0
+    m = len(output_calls)
+    n = len(label_calls)
+    union = m + n - matched  # Jaccard denominator
+
+    if union == 0:
+        return (1.0, 1.0)
+
+    name_score = matched / union
+    param_score = sum(pair_param_scores) / union
 
     return (name_score, param_score)
 
