@@ -269,10 +269,16 @@ def _is_garbled_output(trajectory: list[dict[str, Any]]) -> bool:
     RM (especially when pointing at the same SGLang endpoint) will incorrectly
     score as reasonable.  We detect this via character and trigram diversity
     and skip the RM call entirely.
+
+    Works with both standard (``role``/``content``) and tool_rl-style
+    (``type``/``text``) trajectories.
     """
-    text = " ".join(
-        msg.get("content", "") for msg in trajectory if msg.get("role") == "assistant"
-    )
+    parts = []
+    for msg in trajectory:
+        role = msg.get("role", "") or msg.get("type", "")
+        if role in ("assistant", "turn"):
+            parts.append(msg.get("content", "") or msg.get("text", ""))
+    text = " ".join(parts)
     # Strip XML tags to get the raw reasoning/text content
     text = re.sub(r"<[^>]+>", "", text).strip()
     if len(text) < 20:
@@ -408,11 +414,17 @@ def _parse_rm_v2(text: str) -> dict | None:
         cands.append(text)
     for m in re.finditer(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL):
         cands.append(m.group(1).strip())
+    # Third fallback: try to find JSON-like substring containing both keys
+    # (no regex compilation risk)
     for m in re.finditer(
-        r'\{[^{}]*"tool_name_score"[^{}]*(?"param_content_score"[^{}]*)*\}',
-        text, re.DOTALL,
+        r'tool_name_score', text,
     ):
-        cands.append(m.group(0))
+        # Find the nearest enclosing { } block
+        idx = m.start()
+        open_brace = text.rfind("{", 0, idx)
+        close_brace = text.find("}", idx)
+        if open_brace >= 0 and close_brace > open_brace:
+            cands.append(text[open_brace:close_brace + 1])
 
     for c in cands:
         try:

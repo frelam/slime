@@ -18,29 +18,43 @@ Beijing
 
 Multiple tool calls appear as separate `<tool_call>` blocks.
 
-## Dimension 1: Planning & Reasoning Quality (score: 1.0, 0.6, 0.3, or -0.2)
+## Evaluation Dimensions
 
-Evaluate how well the agent planned and reasoned through the task:
+### Dimension 1: Tool Name Correctness (score: 0.0–1.0)
 
-| Level | Score | Criteria |
-|-------|-------|----------|
-| 优秀 (Excellent) | 1.0 | Correct understanding of the problem. Reasoning is correct. Planning is correct. Correct tools selected with proper dependencies. |
-| 良好 (Good) | 0.6 | Correct understanding of the problem. Planning is correct, but wrong tool selection OR missed dependencies between tools. |
-| 合格 (Adequate) | 0.3 | Correct understanding of the problem, but planning has flaws AND tool selection is wrong. |
-| 差 (Poor) | -0.2 | Misunderstood the problem. Planning and tool calls are wrong. Did NOT use tools when needed, or was overly cautious/avoidant. |
+Evaluate whether the agent selected the **correct tools** for the task:
 
-**Key indicators of Poor (-0.2):**
-- The agent needed tools but did not use any
-- The agent completely misunderstood what the user wanted
-- The agent was overly conservative (e.g., repeatedly asking instead of using tools)
-- The agent chose tools that are completely unrelated to the task
+| Score | Criteria |
+|-------|----------|
+| 1.0 | All tool names are exactly right for the task. The required tools are present and no unrelated tools are called. |
+| 0.5–0.9 | Most tool names are correct, but some are partially wrong, missing, or extraneous. |
+| 0.0 | All tool names are wrong, or the agent called no tools when tools were clearly required. |
 
-## Dimension 2: Hallucination / Fabrication (score: 0 or 1)
+**Scoring rules:**
+- If the agent calls no tools but the task clearly needs them → score 0.0
+- If the agent calls tools that exist but are irrelevant to the task → penalize (≤ 0.3)
+- If no tools are needed and the agent correctly uses none → score 1.0
+- Multiple correct tool calls → score 1.0; missing some → proportionally lower
 
-Evaluate whether the agent fabricated or assumed information NOT provided:
+### Dimension 2: Parameter Content Correctness (score: 0.0–1.0)
 
-- **Score 0 (Hallucinated):** The agent assumed or guessed information like dates, locations, user preferences, file paths, API keys, or any details not explicitly provided in the user query or tool responses. This includes inventing tool parameter values.
-- **Score 1 (No Hallucination):** The agent only used explicitly provided information. It stayed humble — if information was missing, it used tools to find out or asked the user. Conservative behavior like saying "I don't know" or asking clarifying questions is POSITIVE.
+Evaluate whether the **parameter values** provided by the agent are reasonable, correct, and **not fabricated**:
+
+| Score | Criteria |
+|-------|----------|
+| 1.0 | All parameter values are factually correct, reasonable, and nothing is fabricated. |
+| 0.5–0.9 | Most parameter values are correct, but some are slightly off or guessed. |
+| 0.0 | Parameter values are completely fabricated, hallucinated, or nonsensical. |
+
+**Key indicators of fabrication (score ≤ 0.3):**
+- The agent invents dates, times, names, IDs, or other details not provided in the task
+- The agent guesses tool parameter values without justification
+- The agent returns results that weren't produced by the tools it called
+
+**Positive indicators (score 1.0):**
+- The agent only uses values explicitly provided in the task or obtained through tool outputs
+- The agent says "I don't know" or asks for clarification when information is missing — this is GOOD
+- The agent correctly extracts and passes values between tool calls
 
 ## Output Format
 
@@ -48,9 +62,9 @@ Respond ONLY with a JSON object:
 
 ```json
 {
-  "planning_score": <1.0 | 0.6 | 0.3 | -0.2>,
-  "hallucination_score": <0 | 1>,
-  "planning_reason": "<brief reason>",
-  "hallucination_reason": "<brief reason>"
+  "tool_name_score": <0.0–1.0>,
+  "param_content_score": <0.0–1.0>,
+  "name_reason": "<brief reason for tool name score>",
+  "param_reason": "<brief reason for parameter content score>"
 }
 ```
