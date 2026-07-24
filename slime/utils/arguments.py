@@ -665,6 +665,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
 
+            # --- Tool RL: mask failed tool call tokens from loss ---
+            parser.add_argument(
+                "--mask-failed-tool-calls",
+                action="store_true",
+                default=False,
+                help=(
+                    "Mask tokens belonging to incorrect tool calls (wrong function name, "
+                    "parameter names, or types) by setting their loss_mask to 0. "
+                    "Only effective when the custom generate function supports it "
+                    "(e.g. examples/tool_rl)."
+                ),
+            )
+            parser.add_argument(
+                "--mask-failed-tool-calls-adv-conditioned",
+                action="store_true",
+                default=False,
+                help=(
+                    "When set together with --mask-failed-tool-calls, only mask "
+                    "incorrect tool call tokens when the per-sample advantage is "
+                    "positive (i.e. the sample is better than the group mean). "
+                    "When advantage <= 0, incorrect tool call tokens are kept in "
+                    "the loss so the policy can unlearn them. "
+                    "Requires --custom-tis-function-path examples.tool_rl.tis.tool_rl_tis_function."
+                ),
+            )
+
             parser.add_argument(
                 "--start-rollout-id",
                 type=int,

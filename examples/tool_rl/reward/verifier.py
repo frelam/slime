@@ -237,20 +237,7 @@ def check_tool_call_format(
     n = len(parsed)
     available = available_tools or []
 
-    # Build index: tool_name → {param_name → param_info}
-    tool_names: set[str] = set()
-    tool_params: dict[str, dict[str, dict]] = {}
-    for tool in available:
-        name = tool.get("name", "")
-        if not name:
-            continue
-        tool_names.add(name)
-        params = tool.get("parameters", {})
-        props = params.get("properties", params) if isinstance(params, dict) else {}
-        if isinstance(props, dict):
-            # Check if values look like param defs (have "type" key)
-            if props and isinstance(next(iter(props.values()), None), dict):
-                tool_params[name] = props
+    tool_names, tool_params = _build_tool_index(available)
 
     name_acc = 0.0
     pname_acc = 0.0
@@ -329,6 +316,147 @@ def _check_types(
             logger.debug("[dim3] Type mismatch: %s=%s (expected %s, got %s)",
                          k, v, dtype, type(v).__name__)
     return correct / max(len(args), 1)
+
+
+# ============================================================================
+# Tool call correctness — per-call verdict (for token-level loss masking)
+# ============================================================================
+
+
+def _build_tool_index(
+    available_tools: list[dict[str, Any]] | None,
+) -> tuple[set[str], dict[str, dict[str, dict]]]:
+    """Build tool name set and param index from available_tools.
+
+    Args:
+        available_tools: Tool definitions from the dataset metadata.
+
+    Returns:
+        Tuple of ``(tool_names, tool_params)`` where ``tool_params`` maps
+        tool name → param name → param info dict.
+    """
+    tool_names: set[str] = set()
+    tool_params: dict[str, dict[str, dict]] = {}
+    for tool in (available_tools or []):
+        name = tool.get("name", "")
+        if not name:
+            continue
+        tool_names.add(name)
+        params = tool.get("parameters", {})
+        props = params.get("properties", params) if isinstance(params, dict) else {}
+        if isinstance(props, dict):
+            if props and isinstance(next(iter(props.values()), None), dict):
+                tool_params[name] = props
+    return tool_names, tool_params
+
+
+def _is_tool_call_correct(
+    call: dict[str, Any],
+    tool_names: set[str],
+    tool_params: dict[str, dict[str, dict]],
+) -> bool:
+    """Check whether a single parsed tool call is fully correct.
+
+    A tool call is correct when ALL of:
+    1. Function name exists in ``tool_names``
+    2. All parameter names are declared for that function
+    3. No extra/undeclared parameter names
+    4. All parameter values match declared types
+
+    If ``tool_names`` is empty (no tool definitions available), returns
+    ``True`` (cannot verify — assume correct).
+    """
+    cname = call.get("name", "")
+    cargs = call.get("arguments", {}) or {}
+
+    if not tool_names:
+        return True  # No tool definitions to check against
+
+    # 1. Name correctness
+    if not cname or cname not in tool_names:
+        return False
+
+    # 2-4. Parameter correctness
+    if cname not in tool_params:
+        # Tool has no declared params — any args are wrong
+        return not cargs
+
+    declared = tool_params[cname]
+    declared_names = set(declared.keys())
+
+    if not declared_names:
+        return not cargs  # No declared params, no args expected
+
+    if not cargs:
+        # Tool expects params but none given
+        return False
+
+    # Check for extra/undeclared params
+    for k in cargs:
+        if k not in declared_names:
+            return False
+
+    # Check param types
+    for k, v in cargs.items():
+        if k not in declared:
+            continue
+        dtype = declared[k].get("type", "")
+        expected = _TYPE_MAP.get(dtype.lower()) if dtype else None
+        if expected is not None and not isinstance(v, expected):
+            return False
+
+    return True
+
+
+def get_incorrect_tool_call_spans(
+    text: str,
+    available_tools: list[dict[str, Any]] | None = None,
+) -> list[tuple[int, int]]:
+    """Return ``(start_char, end_char)`` spans of incorrect tool call blocks.
+
+    Parses Qwen XML ``<tool_call>...</tool_call>`` blocks from *text* and checks
+    each one against *available_tools*.  Blocks with wrong function name, wrong
+    parameter names, undeclared parameters, or wrong parameter types are
+    collected.
+
+    Args:
+        text: Raw assistant response containing zero or more tool call blocks.
+        available_tools: Tool definitions.  If empty or ``None``, all tool calls
+            are treated as correct.
+
+    Returns:
+        List of ``(start_char, end_char)`` tuples for incorrect tool call
+        blocks.  Empty if all tool calls are correct or none exist.
+    """
+    tool_names, tool_params = _build_tool_index(available_tools)
+
+    incorrect_spans: list[tuple[int, int]] = []
+
+    for match in _TOOL_CALL_BLOCK_RE.finditer(text):
+        block_text = match.group(1)  # content inside <tool_call>...</tool_call>
+        func_match = _FUNCTION_NAME_RE.search(block_text)
+
+        call: dict[str, Any] = {"name": "", "arguments": {}}
+        if func_match:
+            call["name"] = func_match.group(1)
+
+        for pm in _PARAM_RE.finditer(block_text):
+            pname = pm.group(1)
+            pval = pm.group(2).strip()
+            try:
+                pval = json.loads(pval)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            call["arguments"][pname] = pval
+
+        if not _is_tool_call_correct(call, tool_names, tool_params):
+            incorrect_spans.append((match.start(), match.end()))
+            logger.debug(
+                "[mask] Incorrect tool call: name=%r span=(%d, %d)",
+                call.get("name"), match.start(), match.end(),
+            )
+
+    return incorrect_spans
 
 
 # ============================================================================

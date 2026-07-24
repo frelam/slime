@@ -206,11 +206,11 @@ async def tool_rl_grpo_generate(
                 input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
             else:
                 from slime.utils.processing_utils import load_tokenizer
-                tok = load_tokenizer(
+                tokenizer = load_tokenizer(
                     getattr(args, "hf_checkpoint", ""),
                     trust_remote_code=True,
                 )
-                input_ids = tok.encode(prompt_text, add_special_tokens=False)
+                input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
 
             # 2. Single-turn SGLang generate
             max_resp = getattr(args, "rollout_max_response_len", 4096)
@@ -262,7 +262,13 @@ async def tool_rl_grpo_generate(
             rollout_log_probs = (
                 logprobs if logprobs else [0.0] * response_len
             )
-            loss_mask = [2] * response_len
+            loss_mask = _build_tool_aware_loss_mask(
+                response_text=output_text,
+                response_len=response_len,
+                tokenizer=tokenizer,
+                available_tools=available_tools,
+                enable_masking=getattr(args, "mask_failed_tool_calls", False),
+            )
 
             result = Sample(
                 index=sample.index,
@@ -303,6 +309,111 @@ async def tool_rl_grpo_generate(
     except Exception:
         logger.warning("[tool_rl] %s: failed\n%s", task_id, traceback.format_exc())
         return _abort(sample, f"err:{traceback.format_exc()[:200]}", task_id)
+
+
+# ============================================================================
+# Tool-aware loss mask
+# ============================================================================
+
+
+def _build_tool_aware_loss_mask(
+    response_text: str,
+    response_len: int,
+    tokenizer,
+    available_tools: list[dict] | None = None,
+    enable_masking: bool = False,
+) -> list[int]:
+    """Build per-token loss mask that marks incorrect tool call tokens.
+
+    Uses the tokenizer's offset mapping to map text spans of incorrect tool
+    calls (determined by the verifier) to token positions.
+
+    Mask value encoding (for TIS / advantage-conditioned masking):
+    - ``2`` = normal token (correct tool call, reasoning, or non-tool text)
+    - ``1`` = incorrect tool call token (can be masked by TIS when adv > 0)
+    - ``0`` = unconditionally masked (not used here; reserved for TIS)
+
+    When ``enable_masking=False``, returns ``[2] * response_len``.
+
+    Args:
+        response_text: Decoded response text from SGLang.
+        response_len: Number of tokens in the response.
+        tokenizer: HuggingFace tokenizer instance.
+        available_tools: Tool definitions for correctness checking.
+        enable_masking: If ``False``, returns ``[2] * response_len``.
+
+    Returns:
+        List of mask values (``1`` or ``2``) when masking is enabled,
+        or all ``2`` when disabled.
+    """
+    from examples.tool_rl.reward.verifier import get_incorrect_tool_call_spans
+
+    if not enable_masking:
+        return [2] * response_len
+
+    # Fallback: if tokenizer is unavailable or doesn't support offset mapping,
+    # return all 2 (normal).
+    if tokenizer is None:
+        return [2] * response_len
+
+    try:
+        encoded = tokenizer(
+            response_text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+    except Exception:
+        logger.warning(
+            "[tool_rl] Tokenizer does not support return_offsets_mapping — "
+            "disabling tool call masking"
+        )
+        return [2] * response_len
+
+    token_offsets = encoded.get("offset_mapping")
+    input_ids = encoded.get("input_ids")
+
+    if token_offsets is None or input_ids is None:
+        return [2] * response_len
+
+    # Guard: if token count doesn't match the response length from SGLang,
+    # the offsets won't align — fall back to all 2 (normal).
+    if len(input_ids) != response_len:
+        logger.warning(
+            "[tool_rl] Token count mismatch: tokenizer=%d vs sglang=%d — "
+            "disabling tool call masking",
+            len(input_ids), response_len,
+        )
+        return [2] * response_len
+
+    # Find incorrect tool call character spans
+    incorrect_spans = get_incorrect_tool_call_spans(
+        response_text, available_tools=available_tools,
+    )
+
+    if not incorrect_spans:
+        logger.debug("[tool_rl] All tool calls correct — no tokens tagged")
+        return [2] * response_len
+
+    # Build mask: 2=normal token, 1=incorrect tool call token
+    mask = [2] * response_len
+    tagged_count = 0
+
+    for i, (char_start, char_end) in enumerate(token_offsets):
+        if char_start >= char_end:
+            # Special token (e.g., BOS) — keep as normal (2)
+            continue
+        for span_start, span_end in incorrect_spans:
+            if span_start <= char_start and char_end <= span_end:
+                mask[i] = 1  # incorrect tool call token
+                tagged_count += 1
+                break
+
+    logger.info(
+        "[tool_rl] Tool-aware loss mask: %d/%d tokens tagged as incorrect "
+        "tool call (%d block(s))",
+        tagged_count, response_len, len(incorrect_spans),
+    )
+    return mask
 
 
 def _abort(sample: Sample, reason: str, task_id: str) -> list[Sample]:
