@@ -221,6 +221,7 @@ async def compute_tool_rl_reward(
                 trajectory,
                 task_description,
                 ground_truth_label,
+                available_tools=available_tools,
             )
             name_score = rm["tool_name_score"]
             param_score = rm["param_content_score"]
@@ -301,12 +302,251 @@ def _is_garbled_output(trajectory: list[dict[str, Any]]) -> bool:
 # ============================================================================
 
 
+def _clean_prompt(text: str) -> str:
+    """Clean chat template markers from formatted prompt text.
+
+    Converts Qwen-style ``<|im_start|>role`` / ``<|im_end|>`` markers into
+    markdown headings while preserving all content.  This makes the prompt
+    readable for the RM without losing any context.
+
+    Also handles other common template markers from different model families
+    (e.g. ``<|start_header_id|>`` for Llama, ``<|user|>`` for DeepSeek).
+    """
+    # Qwen markers
+    text = re.sub(r"<\|im_start\|>(\w+)", r"\n### \1\n", text)
+    text = re.sub(r"<\|im_end\|>", "", text)
+    # Llama markers
+    text = re.sub(
+        r"<\|start_header_id\|>(\w+)<\|end_header_id\|>",
+        r"\n### \1\n",
+        text,
+    )
+    text = re.sub(r"<\|eot_id\|>", "", text)
+    # DeepSeek markers
+    text = re.sub(r"<\|user\|>", "\n### user\n", text)
+    text = re.sub(r"<\|assistant\|>", "\n### assistant\n", text)
+    # Collapse 3+ consecutive blank lines
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text.strip()
+
+
+def _format_tools_md(tools: list[dict[str, Any]] | None) -> str:
+    """Format OpenAI function-calling tool definitions as readable markdown.
+
+    Args:
+        tools: List of tool dicts with ``name``, ``description``, and
+               ``parameters`` (OpenAI JSON Schema format).
+
+    Returns:
+        Markdown string, one subsection per tool.
+    """
+    if not tools:
+        return "_No tools available._"
+
+    parts: list[str] = []
+    for tool in tools:
+        name = tool.get("name", "unknown")
+        desc = tool.get("description", "")
+        params: dict[str, Any] = tool.get("parameters", {}) or {}
+        if isinstance(params, dict):
+            props = params.get("properties", {}) or {}
+            required: list[str] = params.get("required", []) or []
+        else:
+            props = {}
+            required = []
+
+        parts.append(f"### `{name}`")
+        if desc:
+            parts.append(desc)
+            parts.append("")
+
+        if props:
+            parts.append("| Parameter | Type | Required | Description |")
+            parts.append("|-----------|------|----------|-------------|")
+            for pname, pinfo in props.items():
+                if isinstance(pinfo, dict):
+                    ptype = pinfo.get("type", "any")
+                    pdesc = pinfo.get("description", "")
+                    enum_vals = pinfo.get("enum")
+                    if enum_vals:
+                        pdesc += f" (enum: {', '.join(str(v) for v in enum_vals)})"
+                else:
+                    ptype = "any"
+                    pdesc = str(pinfo)
+                req_mark = "✅" if pname in required else ""
+                parts.append(
+                    f"| `{pname}` | {ptype} | {req_mark} | {pdesc[:200]} |"
+                )
+            parts.append("")
+
+    return "\n".join(parts)
+
+
+def _format_agent_response_structured(
+    trajectory: list[dict[str, Any]],
+    *,
+    evaluate_last_only: bool = True,
+) -> tuple[str, str]:
+    """Format agent response with separated thinking and structured tool calls.
+
+    Args:
+        trajectory: Trajectory records from ``_response_to_trajectory()``.
+        evaluate_last_only: If True (default), only the **last** assistant
+            turn is formatted as "to evaluate".  Previous turns and all
+            observations are treated as context.
+
+    Returns:
+        ``(context_md, evaluation_md)`` — context-markdown for the
+        conversation history section and evaluation-markdown for the
+        "to evaluate" section.
+
+        If there are no agent turns, ``evaluation_md`` is ``"(no response)"``.
+    """
+    from examples.tool_rl.reward.verifier import parse_qwen_tool_calls
+
+    # Split into agent turns and observations
+    agent_turns: list[dict[str, Any]] = []
+    obs_turns: list[dict[str, Any]] = []
+    for rec in trajectory:
+        if rec.get("type") == "observation":
+            obs_turns.append(rec)
+        else:
+            agent_turns.append(rec)
+
+    # ── Context: observations + previous agent turns ──────────────
+    context_parts: list[str] = []
+
+    for rec in obs_turns:
+        tc = rec.get("tool_call", {})
+        name = tc.get("name", "?") if isinstance(tc, dict) else "?"
+        text = rec.get("text", "")
+        context_parts.append(f"#### Tool Result: `{name}`\n```\n{text[:2000]}\n```\n")
+
+    if evaluate_last_only and len(agent_turns) > 1:
+        for rec in agent_turns[:-1]:
+            turn = rec.get("turn", 0)
+            fin = rec.get("finish_reason", "")
+            context_parts.append(
+                f"#### Assistant (Turn {turn}, {fin})\n{rec.get('text', '')[:3000]}\n"
+            )
+
+    # ── Evaluation target: last agent turn ────────────────────────
+    target_turns = agent_turns[-1:] if (evaluate_last_only and agent_turns) else agent_turns
+    eval_parts: list[str] = []
+
+    if not target_turns:
+        return ("\n".join(context_parts).strip(), "(no response)")
+
+    for rec in target_turns:
+        text = rec.get("text", "")
+
+        # Extract thinking
+        think_match = re.search(
+            r"<think>(.*?)</think>", text, re.DOTALL | re.IGNORECASE,
+        )
+        if think_match:
+            thinking = think_match.group(1).strip()
+            eval_parts.append("### Thinking\n")
+            eval_parts.append(thinking)
+            eval_parts.append("")
+
+        # Extract structured tool calls
+        tool_calls = rec.get("tool_calls_parsed")
+        if not tool_calls:
+            tool_calls = parse_qwen_tool_calls(text)
+
+        if tool_calls:
+            eval_parts.append("### Tool Calls\n")
+            eval_parts.append("```json")
+            eval_parts.append(
+                json.dumps(tool_calls, indent=2, ensure_ascii=False),
+            )
+            eval_parts.append("```")
+            eval_parts.append("")
+        else:
+            eval_parts.append(
+                "### Tool Calls\n\n_(no tool calls detected in response)_\n",
+            )
+
+    return ("\n".join(context_parts).strip(), "\n".join(eval_parts).strip())
+
+
+def _build_rm_user_message(
+    task_description: str,
+    trajectory: list[dict[str, Any]],
+    available_tools: list[dict[str, Any]] | None,
+    ground_truth_label: str,
+) -> str:
+    """Assemble the complete user message for the RM evaluation call.
+
+    The message has a clear three-section structure so the RM can
+    distinguish **context** (what the agent knew) from **response**
+    (what the agent did — the actual evaluation target).
+
+    Sections
+    --------
+    1. **Conversation Context** — the full prompt (cleaned), including
+       all previous user messages and any prior tool interaction history.
+    2. **Available Tools** — structured tool definitions in a table.
+    3. **Agent Response (to evaluate)** — only the last assistant turn,
+       with thinking and tool calls separated.
+    4. *(optional)* **Ground Truth** — reference for the RM.
+
+    Returns:
+        Sanitized markdown string ready for the RM API.
+    """
+    # Clean the prompt text
+    clean_prompt = _clean_prompt(task_description)
+
+    # Format available tools
+    tools_md = _format_tools_md(available_tools)
+
+    # Split trajectory into context and evaluation sections
+    context_md, evaluation_md = _format_agent_response_structured(
+        trajectory, evaluate_last_only=True,
+    )
+
+    # ── Assemble ──────────────────────────────────────────────────
+    sections: list[str] = [
+        "## Conversation Context\n",
+        clean_prompt,
+    ]
+
+    if context_md:
+        sections.append(f"\n### Previous Tool Interactions\n\n{context_md}")
+
+    sections.extend([
+        "",
+        "## Available Tools\n",
+        tools_md,
+        "",
+        "## Agent Response (to evaluate)\n",
+        evaluation_md,
+    ])
+
+    if ground_truth_label:
+        sections.extend([
+            "",
+            "## Ground Truth (Reference)\n",
+            ground_truth_label[:2000],
+        ])
+
+    sections.append(
+        "\n\nEvaluate the agent's tool calls shown above in "
+        "\"## Agent Response (to evaluate)\". "
+        "Output your evaluation as a JSON object.",
+    )
+
+    return "\n".join(sections)
+
+
 async def _call_rm_v2(
     args: Any,
     trajectory: list[dict[str, Any]],
     task_description: str,
     ground_truth_label: str,
     *,
+    available_tools: list[dict[str, Any]] | None = None,
     max_retries: int = 2,
 ) -> dict[str, Any]:
     """Call RM for tool name + param content scoring (structured 2-dim).
@@ -330,12 +570,13 @@ async def _call_rm_v2(
     prompt_dir = getattr(args, "rm_system_prompt_dir", "examples/tool_rl/reward/prompts")
     system_prompt = _load_prompt("tool_rl", prompt_dir)
 
-    # 2. User message
-    traj_text = _format_traj(trajectory)
-    user = f"## Task Description\n\n{task_description[:5000]}\n\n## Agent Trajectory\n\n{traj_text}\n\n"
-    if ground_truth_label:
-        user += f"## Ground Truth (Reference)\n\n{ground_truth_label[:2000]}\n\n"
-    user += "Output your evaluation as a JSON object."
+    # 2. User message — structured: context → tools → response to evaluate
+    user = _build_rm_user_message(
+        task_description,
+        trajectory,
+        available_tools=available_tools,
+        ground_truth_label=ground_truth_label,
+    )
 
     # Sanitize text content to prevent HTTP protocol errors.
     # Model outputs can contain control characters (e.g. null bytes,
@@ -484,7 +725,12 @@ def _load_prompt(task_type: str, prompt_dir: str) -> str:
     return fallback
 
 
-def _format_traj(trajectory: list[dict]) -> str:
+def _format_traj(trajectory: list[dict]) -> str:  # pragma: no cover — deprecated
+    """Deprecated: kept for backward compatibility.
+
+    Use :func:`_format_agent_response_structured` +
+    :func:`_build_rm_user_message` instead.
+    """
     parts = []
     for rec in trajectory:
         turn = rec.get("turn", 0)
