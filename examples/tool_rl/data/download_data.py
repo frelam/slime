@@ -108,7 +108,7 @@ def _make_meta(source: str, task_id: str, tools: list, gt: Any, **extra) -> dict
         "benchmark": "tool_rl",
         "source": source,
         "task_id": task_id,
-        "ground_truth": gt if gt else None,
+        "ground_truth": gt,  # preserve [] (means "no tools needed")
         "has_ground_truth": bool(gt),
         "tools": _normalize_tools(tools),
         "max_turns": 1,
@@ -441,7 +441,9 @@ def _parse_bfcl(raw: dict, category: str) -> list[dict]:
         # Parse ground truth for this turn
         gt_raw = raw.get("ground_truth") or raw.get("answers") or raw.get("answer") or ""
         if isinstance(gt_raw, list):
-            gt_str = "\n".join(str(g) for g in gt_raw if g) if gt_raw else ""
+            gt_str = "\n".join(
+                json.dumps(g, ensure_ascii=False) for g in gt_raw if g
+            ) if gt_raw else ""
         elif isinstance(gt_raw, str):
             gt_str = gt_raw
         else:
@@ -554,18 +556,25 @@ def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
 
         calls.append({"name": func_name, "arguments": args})
 
-    # Fallback: JSON tool calls
+    # Fallback: JSON tool calls — bracket-matching handles nested args
     if not calls:
-        for m in re.finditer(
-            r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^{}]*\}\s*\}',
-            text, re.DOTALL,
-        ):
-            try:
-                obj = json.loads(m.group(0))
-                if "name" in obj:
-                    calls.append(obj)
-            except json.JSONDecodeError:
-                pass
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        obj = json.loads(text[start : i + 1])
+                        if isinstance(obj, dict) and "name" in obj:
+                            calls.append(obj)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    start = -1
 
     return calls
 

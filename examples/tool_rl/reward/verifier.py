@@ -52,11 +52,34 @@ _PARAM_RE = re.compile(
     r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", re.DOTALL,
 )
 
-# Fallback: JSON format tool calls
-_TOOL_CALL_JSON_RE = re.compile(
-    r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^{}]*\}\s*\}',
-    re.DOTALL,
-)
+# Fallback: JSON format tool calls — bracket-matching is more robust than
+# regex because it handles nested objects/arrays inside arguments.
+def _extract_json_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Extract ``{"name": …, "arguments": {…}}`` objects from text.
+
+    Uses bracket-depth tracking so nested parameter values (objects,
+    arrays of objects, etc.) are handled correctly.
+    """
+    results: list[dict[str, Any]] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    obj = json.loads(text[start : i + 1])
+                except (json.JSONDecodeError, TypeError):
+                    start = -1
+                    continue
+                if isinstance(obj, dict) and "name" in obj:
+                    results.append(obj)
+                start = -1
+    return results
 
 
 # ============================================================================
@@ -93,13 +116,9 @@ def parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
 
     # Fallback: JSON format
     if not calls:
-        for m in _TOOL_CALL_JSON_RE.finditer(text):
-            try:
-                obj = json.loads(m.group(0))
-                if "name" in obj and obj not in calls:
-                    calls.append(obj)
-            except json.JSONDecodeError:
-                pass
+        for obj in _extract_json_tool_calls(text):
+            if obj not in calls:
+                calls.append(obj)
 
     return calls
 
@@ -130,7 +149,7 @@ def check_format_compliance(
     """
     all_text = _get_agent_text(trajectory)
     n_calls = len(_TOOL_CALL_BLOCK_RE.findall(all_text))
-    n_calls += len(_TOOL_CALL_JSON_RE.findall(all_text))
+    n_calls += len(_find_json_tool_call_spans(all_text))
 
     if n_calls == 0:
         if available_tools:
@@ -161,6 +180,27 @@ def _get_agent_text(trajectory: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _find_json_tool_call_spans(text: str) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` spans of ``{"name": …}`` objects in *text*.
+
+    Uses bracket-depth tracking — robust against nested arguments.
+    """
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                spans.append((start, i + 1))
+                start = -1
+    return spans
+
+
 def _all_calls_after_think(text: str) -> bool:
     """Check all <tool_call> blocks are after the last </think>."""
     last_end = 0
@@ -171,8 +211,8 @@ def _all_calls_after_think(text: str) -> bool:
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         if m.start() < last_end:
             return False
-    for m in _TOOL_CALL_JSON_RE.finditer(text):
-        if m.start() < last_end:
+    for start, end in _find_json_tool_call_spans(text):
+        if start < last_end:
             return False
     return True
 
@@ -186,8 +226,8 @@ def _count_preceded_by_think(text: str, total: int) -> int:
     call_starts = []
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         call_starts.append(m.start())
-    for m in _TOOL_CALL_JSON_RE.finditer(text):
-        call_starts.append(m.start())
+    for start, end in _find_json_tool_call_spans(text):
+        call_starts.append(start)
     call_starts.sort()
 
     count = 0
@@ -485,6 +525,10 @@ def _values_match(v1: Any, v2: Any) -> bool:
         return True
     if v1 is None or v2 is None:
         return False
+    # bool is a subclass of int — True == 1 and False == 0 in Python,
+    # but they are semantically different for tool-call parameters.
+    if isinstance(v1, bool) != isinstance(v2, bool):
+        return False
     if isinstance(v1, str) and isinstance(v2, str):
         return v1.strip().lower() == v2.strip().lower()
     if isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
@@ -510,7 +554,8 @@ def _param_content_score(
     if not label_args and not output_args:
         return 1.0
     if not label_args:
-        return 1.0  # tool expects no params, none given
+        # Label expects no params but output provided some → hallucinated args
+        return 0.0
 
     correct = sum(
         1 for k, lv in label_args.items()

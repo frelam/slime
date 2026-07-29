@@ -183,13 +183,15 @@ async def compute_tool_rl_reward(
     tool_call_score = verifier["tool_call_format"]
 
     # Parse the model's tool calls from trajectory text
-    all_text = _get_agent_text(trajectory)
+    all_text = "\n".join(r.get("text", "") for r in trajectory if r.get("type") != "observation")
     output_calls = parse_qwen_tool_calls(all_text)
 
     # ── Dim 1: Tool Call Correctness ────────────────────
+    # has_gt distinguishes: None (no label) vs [] (label says "no tools needed")
+    has_gt = ground_truth_calls is not None
     parsed_gt = parse_ground_truth_calls(ground_truth_calls)
 
-    if parsed_gt:
+    if has_gt:
         # ── Label mode: rule-based matching ──
         source = "label"
         name_score, param_score = match_tool_calls_against_label(
@@ -258,11 +260,6 @@ async def compute_tool_rl_reward(
         source,
     )
     return breakdown
-
-
-def _get_agent_text(trajectory: list[dict[str, Any]]) -> str:
-    """Extract assistant-generated text from a trajectory."""
-    return "\n".join(r.get("text", "") for r in trajectory if r.get("type") != "observation")
 
 
 def _is_garbled_output(trajectory: list[dict[str, Any]]) -> bool:

@@ -136,19 +136,25 @@ def _response_to_trajectory(text: str) -> list[dict[str, Any]]:
             args[pm.group(1)] = pval
         tool_calls.append({"name": func_match.group(1), "arguments": args})
 
-    # Fallback: JSON format tool calls
+    # Fallback: JSON format tool calls — bracket-matching handles nested args
     if not tool_calls:
-        _TOOL_CALL_JSON_RE = re.compile(
-            r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^{}]*\}\s*\}',
-            re.DOTALL,
-        )
-        for m in _TOOL_CALL_JSON_RE.finditer(text):
-            try:
-                obj = json.loads(m.group(0))
-                if "name" in obj:
-                    tool_calls.append(obj)
-            except json.JSONDecodeError:
-                pass
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        obj = json.loads(text[start : i + 1])
+                        if isinstance(obj, dict) and "name" in obj:
+                            tool_calls.append(obj)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    start = -1
 
     return [{
         "turn": 0,
