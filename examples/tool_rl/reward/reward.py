@@ -169,6 +169,7 @@ async def compute_tool_rl_reward(
         ``ToolRLRewardBreakdown`` with all dimension scores.
     """
     from examples.tool_rl.reward.verifier import (
+        _format_call,
         compute_verifier_scores,
         match_tool_calls_against_label,
         parse_ground_truth_calls,
@@ -208,6 +209,15 @@ async def compute_tool_rl_reward(
     else:
         # ── RM mode: LLM judge (structured 2-dim scoring) ──
         source = "rm"
+        # Log extracted calls even in RM mode (for debugging)
+        if output_calls:
+            logger.info("[tool_rl] RM mode — Model calls (%d):", len(output_calls))
+            for i, c in enumerate(output_calls):
+                logger.info("[tool_rl]   [%d] %s", i + 1, _format_call(c))
+        else:
+            logger.info("[tool_rl] RM mode — Model calls: (none)")
+        if ground_truth_label:
+            logger.info("[tool_rl] RM mode — Label: %s", ground_truth_label[:300])
         if _is_garbled_output(trajectory):
             name_score = 0.0
             param_score = 0.0

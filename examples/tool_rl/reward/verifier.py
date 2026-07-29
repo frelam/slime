@@ -567,6 +567,19 @@ def _param_content_score(
     return max(0.0, correct / len(label_args) - penalty)
 
 
+def _format_call(call: dict[str, Any]) -> str:
+    """Format a tool call as ``name(key=val, ...)`` for logging."""
+    name = call.get("name", "?")
+    args = call.get("arguments", {}) or {}
+    if args:
+        params = ", ".join(
+            "%s=%s" % (k, json.dumps(v, ensure_ascii=False))
+            for k, v in args.items()
+        )
+        return "%s(%s)" % (name, params)
+    return name + "()"
+
+
 def match_tool_calls_against_label(
     output_calls: list[dict[str, Any]],
     label_calls: list[dict[str, Any]],
@@ -593,9 +606,29 @@ def match_tool_calls_against_label(
     Returns:
         Tuple ``(name_score, param_score)`` each in ``[0.0, 1.0]``.
     """
+    # ── Log extracted calls ──────────────────────────────
+    if output_calls:
+        logger.info("[tool_rl] Model calls (%d):", len(output_calls))
+        for i, c in enumerate(output_calls):
+            logger.info("[tool_rl]   [%d] %s", i + 1, _format_call(c))
+    else:
+        logger.info("[tool_rl] Model calls: (none)")
+
+    if label_calls:
+        logger.info("[tool_rl] Label calls (%d):", len(label_calls))
+        for i, c in enumerate(label_calls):
+            logger.info("[tool_rl]   [%d] %s", i + 1, _format_call(c))
+    else:
+        logger.info("[tool_rl] Label calls: (none / no tools needed)")
+
     if not label_calls:
         # Label says "no tools needed"
-        return (1.0, 1.0) if not output_calls else (0.0, 0.0)
+        result = (1.0, 1.0) if not output_calls else (0.0, 0.0)
+        if output_calls:
+            logger.info("[tool_rl] Mismatch: label expects no tools, but model called %d tool(s)", len(output_calls))
+        else:
+            logger.info("[tool_rl] Match: both empty → 1.0")
+        return result
 
     matched_indices: set[int] = set()
     pair_param_scores: list[float] = []
@@ -631,6 +664,21 @@ def match_tool_calls_against_label(
 
     name_score = matched / union
     param_score = sum(pair_param_scores) / union
+
+    # ── Log unmatched calls ───────────────────────────────
+    unmatched_output = [
+        (i, _format_call(output_calls[i]))
+        for i in range(m) if i not in matched_indices
+    ]
+    if unmatched_output:
+        logger.info("[tool_rl] Unmatched output (%d):", len(unmatched_output))
+        for idx, call_str in unmatched_output:
+            logger.info("[tool_rl]   [#%d] %s", idx + 1, call_str)
+
+    logger.info(
+        "[tool_rl] Match result: name=%.3f param=%.3f (matched %d/%d label calls)",
+        name_score, param_score, matched, n,
+    )
 
     return (name_score, param_score)
 
