@@ -108,7 +108,7 @@ def _make_meta(source: str, task_id: str, tools: list, gt: Any, **extra) -> dict
         "benchmark": "tool_rl",
         "source": source,
         "task_id": task_id,
-        "ground_truth": gt,  # preserve [] (means "no tools needed")
+        "ground_truth": gt,  # None=no label, []=no tools needed, [{...}]=tool calls
         "has_ground_truth": bool(gt),
         "tools": _normalize_tools(tools),
         "max_turns": 1,
@@ -451,7 +451,7 @@ def _parse_bfcl(raw: dict, category: str) -> list[dict]:
         if gt_str.strip():
             gt = _parse_qwen_tool_calls(gt_str)
         else:
-            gt = []
+            gt = None  # BFCL has no ground truth — will use RM mode
 
         results.append({
             "messages": msgs,
