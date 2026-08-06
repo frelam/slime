@@ -1,5 +1,6 @@
 import ast
 import logging
+import sys
 
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
@@ -145,8 +146,57 @@ def _hf_validate_args(args, hf_config):
 
 
 def _set_default_megatron_args(args):
-    # always use zero optimizer
-    args.use_distributed_optimizer = True
+    # always use zero optimizer (except Muon: Megatron's Muon does not support
+    # the distributed optimizer — see get_megatron_muon_optimizer)
+    if "muon" not in getattr(args, "optimizer", ""):
+        args.use_distributed_optimizer = True
+    # RL training must match the rollout/inference distribution: the SFT/RL
+    # checkpoints are trained with dropout 0 (e.g. attention_dropout=0.0 in the
+    # HF config) and the SGLang old-logprobs have no dropout.
+    #
+    # IMPORTANT: this Megatron checkout AUTO-GENERATES --hidden-dropout and
+    # --attention-dropout CLI args from the TransformerConfig dataclass fields
+    # (ArgumentGroupFactory in megatron/training/arguments.py
+    # `_add_network_size_args`; the fields are not in its exclude list), and
+    # the dataclass defaults are 0.1. Therefore the parsed args ALWAYS carry
+    # hidden_dropout=0.1 / attention_dropout=0.1 unless the flags are passed,
+    # and a `not hasattr(...) or ... is None` guard would NEVER trigger -> the
+    # train-mode forward would apply dropout 0.1 while eval/SGLang apply none
+    # -> train vs old logprob mismatch -> inflated ppo_kl / pg_loss -> NaN
+    # gradients. Force 0.0 unconditionally (an explicit --hidden-dropout /
+    # --attention-dropout on the CLI is respected, in which case the user
+    # takes responsibility for matching the rollout distribution).
+    if not any(a.startswith("--hidden-dropout") for a in sys.argv):
+        args.hidden_dropout = 0.0
+    if not any(a.startswith("--attention-dropout") for a in sys.argv):
+        args.attention_dropout = 0.0
+    # RL batches are orders of magnitude smaller than pretraining batches
+    # (tens of thousands of tokens vs ~1M), so per-logit gradient magnitudes
+    # are correspondingly LARGER after loss scaling. Megatron's default
+    # initial loss scale (2**32) then overflows the fp16 gradient buffer
+    # (fp16 max 65504) on the first step(s) -> found_inf -> optimizer step
+    # skipped -> grad_norm stays nan and no learning happens until the
+    # dynamic scaler halves down a few times (with --num-steps-per-rollout 1
+    # and --no-save-optim every run restarts at 2**32). Start fp16 at 2**16
+    # instead; the dynamic scaler ramps up as usual once grads fit.
+    # Respect an explicit --initial-loss-scale on the CLI.
+    if args.fp16 and not any(a.startswith("--initial-loss-scale") for a in sys.argv):
+        args.initial_loss_scale = 2**16
+    # GPU/Host memory balance: with --optimizer-cpu-offload the fp32 Adam
+    # state is ~24GB/rank (master + exp_avg + exp_avg_sq) and pinned fp32
+    # grads ~8GB/rank. `--optimizer-offload-fraction` is the fraction of
+    # params OFFLOADED TO CPU. The 1.0 default puts all 32GB/rank on a host
+    # that is cgroup-limited to 100GB -> host OOM the moment the optimizer
+    # actually steps (steps were previously skipped via found_inf, which
+    # masked this). The 32GB GPU baseline (model 4GB + fp16 grads 4GB +
+    # fp32 decoupled grads 8GB + ref model 4GB + logits/activations ~2.5GB)
+    # leaves only ~8GB for optimizer state, so offload 75% to CPU (0.75):
+    # GPU peak ~28.5GB/rank, host ~30GB/rank (~60GB node, fits 100GB cgroup).
+    # Respect an explicit flag.
+    if getattr(args, "optimizer_cpu_offload", False) and not any(
+        a.startswith("--optimizer-offload-fraction") for a in sys.argv
+    ):
+        args.optimizer_offload_fraction = 0.75
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
     # Checkpoint I/O defaults: these keep checkpoint contents unchanged while

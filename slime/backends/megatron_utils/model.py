@@ -305,13 +305,30 @@ def setup_model_and_optimizer(
         assert config.optimizer == "adam", "Stateless Adam only supports --optimizer adam."
         assert args.no_save_optim, "Stateless Adam does not save Adam moment states. Please set --no-save-optim."
 
-    optimizer_context = _patch_megatron_adam(StatelessAdam) if args.use_stateless_adam else nullcontext()
-    with optimizer_context:
-        optimizer = get_megatron_optimizer(
+    if "muon" in config.optimizer:
+        # Muon (2D linear weights) + AdamW (everything else) chained optimizer.
+        # Dispatch mirrors megatron/training/training.py:setup_model_and_optimizer.
+        # Requires the `emerging-optimizers` package (pip install emerging-optimizers
+        # from https://github.com/NVIDIA-NeMo/Emerging-Optimizers).
+        from megatron.core.optimizer.muon import get_megatron_muon_optimizer
+
+        assert not args.use_stateless_adam, "Stateless Adam is incompatible with Muon."
+        optimizer = get_megatron_muon_optimizer(
             config=config,
             model_chunks=model,
             use_gloo_process_groups=args.enable_gloo_process_groups,
+            layer_wise_distributed_optimizer="dist" in config.optimizer,
         )
+    else:
+        optimizer_context = (
+            _patch_megatron_adam(StatelessAdam) if args.use_stateless_adam else nullcontext()
+        )
+        with optimizer_context:
+            optimizer = get_megatron_optimizer(
+                config=config,
+                model_chunks=model,
+                use_gloo_process_groups=args.enable_gloo_process_groups,
+            )
     if args.use_stateless_adam:
         _disable_distributed_optimizer_state_initialization(optimizer)
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
@@ -426,8 +443,9 @@ def forward_only(
             "attention_mask": None,
             "labels": None,
             # Packed sequences (THD format) require TEDotProductAttention.
-            # Fall back to unbatched (variable-length) processing for local impl.
-            "packed_seq_params": packed_seq_params if getattr(args, "transformer_impl", None) == "transformer_engine" else None,
+            # We still pass packed_seq_params for the local impl because the
+            # DotProductAttention patch in __init__.py handles THD unpacking.
+            "packed_seq_params": packed_seq_params,
             "loss_mask": batch["full_loss_masks"],
         }
         if batch["multimodal_train_inputs"] is not None:

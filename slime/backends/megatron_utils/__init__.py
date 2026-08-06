@@ -58,10 +58,12 @@ try:
             q_split = query.split(seqlens)
             k_split = key.split(seqlens)
             v_split = value.split(seqlens)
-            for q, k, v in zip(q_split, k_split, v_split):
-                out = _original_dpa_forward(self, q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+            for q, k, v in zip(q_split, k_split, v_split, strict=False):
+                # DotProductAttention expects [sq, b, np, hn]; THD gives
+                # [sq, np, hn] per sequence, so the batch dim goes at position 1.
+                out = _original_dpa_forward(self, q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
                                             attention_mask, attn_mask_type, attention_bias, None)
-                outputs.append(out.squeeze(0))
+                outputs.append(out.squeeze(1))
             return torch.cat(outputs, dim=0)
         return _original_dpa_forward(self, query, key, value, attention_mask,
                                       attn_mask_type, attention_bias, None)
@@ -70,6 +72,28 @@ try:
     logging.getLogger(__name__).info("Patched DotProductAttention to handle packed_seq_params")
 except (ImportError, AttributeError) as e:
     logging.getLogger(__name__).warning("Could not patch DotProductAttention: %s", e)
+
+# Patch torch.nn.RMSNorm to compute in fp32. On fp16 inputs the stock forward
+# computes mean(x^2) in half precision, which overflows to inf for rows whose
+# L2 norm exceeds ~sqrt(65504 * H) (e.g. ~12948 for H=2560). Overflowing rows
+# get rstd=0 -> the whole row is zeroed -> near-uniform logits -> entropy ~
+# ln(vocab), huge logprob diffs, ppo_kl spikes and NaN gradients. Long
+# tool-RL prompts produce such rows (observed L2 norms up to ~16760 at the
+# final-block input). fp32 compute is exact for every representable fp16 row
+# and costs negligible time. Covers input_layernorm / pre_mlp_layernorm /
+# qk_layernorm / final_layernorm (local impl builds all of these as
+# torch.nn.RMSNorm via WrappedTorchNorm). Module structure is unchanged so
+# checkpoints stay compatible.
+try:
+    _orig_rmsnorm_forward = torch.nn.RMSNorm.forward
+
+    def _rmsnorm_fp32_forward(self, input: torch.Tensor) -> torch.Tensor:
+        return _orig_rmsnorm_forward(self, input.float()).to(input.dtype)
+
+    torch.nn.RMSNorm.forward = _rmsnorm_fp32_forward
+    logging.getLogger(__name__).info("Patched torch.nn.RMSNorm to compute in fp32 (overflow-safe)")
+except Exception as e:
+    logging.getLogger(__name__).warning("Could not patch torch.nn.RMSNorm: %s", e)
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
 

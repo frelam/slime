@@ -129,11 +129,18 @@ def compute_policy_loss(
     eps_clip_high: float,
     eps_clip_c: float | None = None,
 ):
+    # fp16 exp overflows when ppo_kl < -11 (ratio = exp(-ppo_kl) > 65504).
+    # Cast to fp32 for the whole computation and convert the final loss back.
+    # The overhead is negligible (a handful of element-wise ops per token).
+    dtype = ppo_kl.dtype
+    ppo_kl = ppo_kl.float()
+    advantages = advantages.float()
+
     ratio = (-ppo_kl).exp()
     pg_losses1 = -ratio * advantages
     pg_losses2 = -ratio.clamp(1 - eps_clip, 1 + eps_clip_high) * advantages
     clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
-    clipfrac = torch.gt(pg_losses2, pg_losses1).float()
+    clipfrac = torch.gt(pg_losses2, pg_losses1)
 
     if eps_clip_c is not None:
         assert (
@@ -145,7 +152,7 @@ def compute_policy_loss(
     else:
         pg_losses = clip_pg_losses1
 
-    return pg_losses, clipfrac
+    return pg_losses.to(dtype), clipfrac.to(dtype)
 
 
 @torch.compile(dynamic=True)
@@ -164,11 +171,12 @@ def compute_cispo_loss(
     reuse the delta-from-1 convention of ``compute_policy_loss``; canonical CISPO
     disables the lower bound (``eps_clip >= 1.0``).
     """
-    ratio = (-ppo_kl).exp()
+    # Compute ratio in fp32 to avoid overflow (same rationale as compute_policy_loss).
+    ratio = (-ppo_kl.float()).exp()
     ratio_truncated = torch.clamp(ratio, min=1.0 - eps_clip, max=1.0 + eps_clip_high)
-    pg_losses = -ratio_truncated.detach() * advantages * log_probs
-    clipfrac = (ratio_truncated != ratio).float()
-    return pg_losses, clipfrac
+    pg_losses = -ratio_truncated.detach() * advantages.float() * log_probs.float()
+    clipfrac = (ratio_truncated != ratio)
+    return pg_losses.to(ppo_kl.dtype), clipfrac.to(ppo_kl.dtype)
 
 
 def _maybe_all_reduce(tensor: torch.Tensor, op: dist.ReduceOp, process_group) -> None:
