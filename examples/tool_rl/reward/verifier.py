@@ -16,9 +16,14 @@ Dimensions
 ----------
 - **Dim 2 (weight 0.20)**: Format compliance — rule verifier
   Scoring:
-    1. All tool_calls after reasoning content → +0.6
-    2. Each tool_call preceded by <think> → +0.4 × 1/N
+    1. All tool_calls after a single, non-empty <think> → +0.6
+    2. Each tool_call preceded by a non-empty <think> → +0.4 × 1/N
     3. No tools used → 1.0
+
+  The <think> block must appear exactly once with non-empty content for
+  full credit — an empty or repeated <think> is not valid reasoning.
+  Empty <tool_call> blocks (no <function=...> header) are not counted as
+  tool calls.
 
 - **Dim 3 (weight 0.20)**: Tool call format correctness — rule verifier
   Scoring (N = total tool calls):
@@ -136,9 +141,15 @@ def check_format_compliance(
     """Check <think>...<tool_call> format compliance.
 
     Scoring:
-      1. All tool_calls after reasoning content → +0.6
-      2. Each tool_call preceded by <think> → +0.4 × count/N
+      1. All tool_calls after a single, non-empty <think> block → +0.6
+      2. Each tool_call preceded by a non-empty <think> → +0.4 × count/N
       3. No tools → 0.0 if tools are defined, 1.0 if no tools at all
+
+    Full credit requires the think block to appear exactly once with
+    non-empty content — an empty or repeated ``<think>`` is not valid
+    reasoning and forfeits the 0.6 portion.  Empty ``<tool_call>`` blocks
+    (those without a ``<function=...>`` header) are not counted as tool
+    calls, matching the other dimensions' parsers.
 
     Args:
         trajectory: Normalized trajectory.
@@ -148,7 +159,7 @@ def check_format_compliance(
         Score in [0.0, 1.0].
     """
     all_text = _get_agent_text(trajectory)
-    n_calls = len(_TOOL_CALL_BLOCK_RE.findall(all_text))
+    n_calls = len(_xml_tool_call_spans(all_text))
     n_calls += len(_find_json_tool_call_spans(all_text))
 
     if n_calls == 0:
@@ -160,12 +171,14 @@ def check_format_compliance(
 
     score = 0.0
 
-    # Rule 1: All tool calls after </think> → +0.6
+    # Rule 1: All tool calls after a single, non-empty think → +0.6
     if _all_calls_after_think(all_text):
         score += 0.6
-        logger.debug("[dim2] All calls after think → +0.6")
+        logger.debug("[dim2] All calls after a single non-empty think → +0.6")
+    else:
+        logger.debug("[dim2] No valid single think (empty/missing/repeated) → no +0.6")
 
-    # Rule 2: Each tool call preceded by <think> → +0.4 × count/N
+    # Rule 2: Each tool call preceded by a non-empty <think> → +0.4 × count/N
     preceded = _count_preceded_by_think(all_text, n_calls)
     if preceded > 0:
         bonus = 0.4 * preceded / n_calls
@@ -201,33 +214,51 @@ def _find_json_tool_call_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _all_calls_after_think(text: str) -> bool:
-    """Check all <tool_call> blocks are after the last </think>."""
-    last_end = 0
-    for m in re.finditer(r"</think>", text, re.IGNORECASE):
-        last_end = m.end()
-    if last_end == 0:
-        return False
+def _xml_tool_call_spans(text: str) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` spans of *valid* ``<tool_call>`` blocks.
+
+    A block is valid only when it declares a function via ``<function=...>``.
+    Empty blocks (``<tool_call></tool_call>``) or blocks without a function
+    header parse to no call in :func:`parse_qwen_tool_calls`, so they are
+    excluded here to keep the format-score call count consistent with the
+    other dimensions.
+    """
+    spans: list[tuple[int, int]] = []
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
-        if m.start() < last_end:
+        if _FUNCTION_NAME_RE.search(m.group(1)):
+            spans.append((m.start(), m.end()))
+    return spans
+
+
+def _all_calls_after_think(text: str) -> bool:
+    """Check all tool calls are after a single, non-empty <think> block.
+
+    Full credit requires exactly one ``<think>...</think>`` with non-empty
+    content — empty or repeated think blocks are not valid reasoning.
+    """
+    matches = list(_THINK_RE.finditer(text))
+    if len(matches) != 1 or not matches[0].group(1).strip():
+        return False
+    think_end = matches[0].end()
+    for start, _end in _xml_tool_call_spans(text):
+        if start < think_end:
             return False
-    for start, end in _find_json_tool_call_spans(text):
-        if start < last_end:
+    for start, _end in _find_json_tool_call_spans(text):
+        if start < think_end:
             return False
     return True
 
 
 def _count_preceded_by_think(text: str, total: int) -> int:
-    """Count how many tool calls have </think> before them."""
-    think_ends = [m.end() for m in re.finditer(r"</think>", text, re.IGNORECASE)]
+    """Count how many tool calls have a non-empty <think> before them."""
+    think_ends = [
+        m.end() for m in _THINK_RE.finditer(text) if m.group(1).strip() != ""
+    ]
     if not think_ends:
         return 0
 
-    call_starts = []
-    for m in _TOOL_CALL_BLOCK_RE.finditer(text):
-        call_starts.append(m.start())
-    for start, end in _find_json_tool_call_spans(text):
-        call_starts.append(start)
+    call_starts = [start for start, end in _xml_tool_call_spans(text)]
+    call_starts.extend(start for start, end in _find_json_tool_call_spans(text))
     call_starts.sort()
 
     count = 0
