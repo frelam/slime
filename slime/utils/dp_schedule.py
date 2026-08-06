@@ -133,10 +133,17 @@ def build_dp_schedule(
     rollout_ids = list(rollout_id_to_samples.keys())
 
     num_steps = len(rollout_ids) // global_batch_size
-    assert num_steps >= 1, (
-        f"num_rollouts ({len(rollout_ids)}) < global_batch_size ({global_batch_size}); "
-        f"need at least one rollout per step."
-    )
+    if num_steps < 1 and len(rollout_ids) > 0:
+        logger.warning(
+            f"num_rollouts ({len(rollout_ids)}) < global_batch_size ({global_batch_size}); "
+            f"using all {len(rollout_ids)} rollouts for a single partial step."
+        )
+        num_steps = 1
+    elif num_steps < 1:
+        assert num_steps >= 1, (
+            f"num_rollouts ({len(rollout_ids)}) < global_batch_size ({global_batch_size}); "
+            f"need at least one rollout per step."
+        )
 
     partitions: list[list[int]] = [[] for _ in range(dp_size)]
     micro_batch_indices: list[list[list[int]]] = [[] for _ in range(dp_size)]
@@ -147,7 +154,7 @@ def build_dp_schedule(
         step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
         sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
         step_lengths = [total_lengths[i] for i in sample_indices]
-        global_batch_sizes.append(global_batch_size)
+        global_batch_sizes.append(len(step_rollouts))
         assert len(sample_indices) >= dp_size, (
             f"step {step_i}: {len(sample_indices)} samples < dp_size {dp_size}; "
             f"each step needs at least one sample per rank."
