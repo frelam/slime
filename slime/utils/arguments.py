@@ -1901,7 +1901,8 @@ def slime_validate_args(args):
             args.no_load_optim = True
             args.no_load_rng = True
             args.finetune = True
-            args.load = args.ref_load
+            if args.load is None:
+                args.load = args.ref_load
             if args.ref_ckpt_step is not None:
                 args.ckpt_step = args.ref_ckpt_step
             args.start_rollout_id = 0
@@ -2011,6 +2012,16 @@ def slime_validate_args(args):
             if args.offload_rollout is False:
                 logger.info("Ignoring --no-offload-rollout because colocated --release-train needs rollout offload.")
             args.offload_rollout = True
+            # Release-train saves weights + syncs to SGLang right after each
+            # training step while the trainer still holds the fp32 optimizer
+            # state; on a 100GB (cgroup-limited) host the save/weight-sync
+            # transient (TP all-gather of the full model) peaks ~97GB and Ray's
+            # default 95% kill threshold kills the trainer mid-save. The cgroup
+            # allows 100GB, so raise the Ray memory threshold to 0.98 (must be
+            # set before `ray start`, which the driver does after parse_args).
+            import os as _os
+
+            _os.environ.setdefault("RAY_memory_usage_threshold", "0.98")
         elif args.offload_train is None:
             args.offload_train = True
         if args.offload_rollout is None:

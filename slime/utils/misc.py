@@ -1,4 +1,7 @@
+import glob
 import importlib
+import os
+import shutil
 import subprocess
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -169,3 +172,27 @@ def _chunk_by_size(objects: Iterable[Any], compute_size: Callable[[Any], int], c
 
     if bucket:
         yield bucket
+
+
+def prune_old_checkpoints(save_dir: str) -> list[str]:
+    """Delete every ``iter_*`` dir except the one named by
+    ``latest_checkpointed_iteration.txt`` (Megatron writes it unpadded, e.g.
+    ``1``, while dirs are zero-padded, e.g. ``iter_0000001`` — compare as ints).
+
+    Returns the list of pruned dir paths. Safe no-op when the latest marker is
+    missing / malformed or no iter dirs exist.
+    """
+    latest_file = os.path.join(save_dir, "latest_checkpointed_iteration.txt")
+    if not os.path.isfile(latest_file):
+        return []
+    with open(latest_file) as _f:
+        latest = _f.read().strip()
+    if not latest.isdigit():
+        return []
+    pruned = []
+    for old in glob.glob(os.path.join(save_dir, "iter_*")):
+        old_iter = os.path.basename(old).replace("iter_", "")
+        if old_iter.isdigit() and int(old_iter) != int(latest):
+            shutil.rmtree(old, ignore_errors=True)
+            pruned.append(old)
+    return pruned

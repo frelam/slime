@@ -17,7 +17,7 @@ from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
-from slime.utils.misc import Box
+from slime.utils.misc import Box, prune_old_checkpoints
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -531,6 +531,86 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_rollout_only:
             return
 
+        # Release-train + --no-save-optim: the fp32 optimizer state (~24GB/rank)
+        # is dead weight during the save / weight-sync that follows — this actor
+        # is killed right after (release-train) and re-created from disk with a
+        # fresh optimizer (no_load_optim since no_save_optim). Freeing it before
+        # the save keeps the TP all-gather peak within the host memory budget
+        # instead of OOM-killing the trainer mid-save. save_checkpoint /
+        # generate_state_dict only touch `optimizer` / `opt_param_scheduler`
+        # when `not args.no_save_optim`, so None is safe.
+        if (
+            getattr(self.args, "release_train", False)
+            and getattr(self.args, "no_save_optim", False)
+            and self.optimizer is not None
+        ):
+            logger.info(
+                "Releasing optimizer state before save (release-train + no-save-optim): "
+                "the actor will be re-created with a fresh optimizer after the weight sync."
+            )
+
+            def _vmrss_gb() -> float:
+                try:
+                    with open("/proc/self/status") as _f:
+                        for _line in _f:
+                            if _line.startswith("VmRSS:"):
+                                return int(_line.split()[1]) / 1024 / 1024
+                except Exception:
+                    pass
+                return -1.0
+
+            _rss_before = _vmrss_gb()
+            import gc
+
+            # Actively zero out every tensor inside the optimizer instead of
+            # relying on object collection: Adam exp_avg / exp_avg_sq on the
+            # CPU-offloaded shards, per-param decoupled_grad, and .grad.
+            # save_checkpoint (no_save_optim) and update_weights never touch
+            # the optimizer, so emptying it here is safe.
+            try:
+                for _chained in getattr(self.optimizer, "chained_optimizers", []):
+                    _opt = getattr(_chained, "optimizer", None)
+                    if _opt is None:
+                        continue
+                    for _group in getattr(_opt, "param_groups", []):
+                        for _p in _group.get("params", []):
+                            _st = getattr(_opt, "state", {}).get(_p)
+                            if isinstance(_st, dict):
+                                for _k in list(_st.keys()):
+                                    _st[_k] = None
+                            if hasattr(_p, "decoupled_grad") and _p.decoupled_grad is not None:
+                                _p.decoupled_grad = None
+                            if _p.grad is not None:
+                                _p.grad = None
+            except Exception as _e:
+                if dist.get_rank() == 0:
+                    logger.warning(f"Optimizer state clearing failed: {_e}")
+
+            self.optimizer = None
+            self.opt_param_scheduler = None
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            # glibc does not return freed heap pages to the OS by default; without
+            # this, RSS stays flat even though the optimizer tensors are gone, and
+            # Ray's memory monitor still sees ~36GB/rank during save -> OOM kill.
+            try:
+                import ctypes
+
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+            try:
+                torch._C._host_emptyCache()
+            except Exception:
+                pass
+            gc.collect()
+            _rss_after = _vmrss_gb()
+            if dist.get_rank() == 0:
+                logger.info(
+                    f"Optimizer released before save: VmRSS {_rss_before:.2f}GB -> {_rss_after:.2f}GB"
+                )
+
         # torch dist may trigger nccl communication during saving.
         if self.args.offload_train:
             self.wake_up()
@@ -541,6 +621,22 @@ class MegatronTrainRayActor(TrainRayActor):
             maybe_finalize_async_save(blocking=True)
 
         save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+
+        # Keep only the latest checkpoint iteration on disk: release-train saves
+        # EVERY rollout (300 rollouts x ~7.5GB = 2.25TB would fill the disk).
+        # latest_checkpointed_iteration.txt is written by megatron after the
+        # iter dir is complete, so it is safe to prune everything older.
+        if getattr(self.args, "release_train", False):
+            try:
+                _save_dir = getattr(self.args, "save", None)
+                if _save_dir:
+                    _pruned = prune_old_checkpoints(_save_dir)
+                    for _old in _pruned:
+                        if dist.get_rank() == 0:
+                            logger.info(f"Pruning old checkpoint dir {_old}")
+            except Exception as _e:
+                if dist.get_rank() == 0:
+                    logger.warning(f"Checkpoint pruning failed: {_e}")
 
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
