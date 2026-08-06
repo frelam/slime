@@ -130,41 +130,68 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     """Load HF checkpoint into Megatron model.
 
     Two modes:
-    - "bridge": use megatron.bridge.AutoBridge (requires megatron.bridge.models)
+    - "bridge": use mbridge.AutoBridge (preferred) or megatron.bridge.AutoBridge
     - "raw" (default): directly load HF weights via transformers into the
       Megatron model parameters.
     """
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
-
         import slime_plugins.megatron_bridge  # noqa: F401  # register custom bridges
 
         logger.info(f"Load checkpoint from HuggingFace model into Megatron (path={load_path})")
 
         with megatron_bridge_utils.patch_megatron_model(ddp_model):
-            bridge = megatron_bridge_utils.patch_auto_bridge_hf_config(
-                AutoBridge.from_hf_pretrained(load_path, trust_remote_code=True)
-            )
-            bridge.load_hf_weights(ddp_model)
+            # Try mbridge first (used by conversion script), fall back to megatron.bridge
+            use_mbridge = False
+            try:
+                from mbridge import AutoBridge as MbBridge
+
+                bridge = megatron_bridge_utils.patch_auto_bridge_hf_config(
+                    MbBridge.from_hf_pretrained(load_path, trust_remote_code=True)
+                )
+                use_mbridge = True
+                logger.info("Using mbridge.AutoBridge to load HF weights")
+            except Exception as e:
+                logger.info("mbridge.AutoBridge not available (%s), trying megatron.bridge.AutoBridge", e)
+                from megatron.bridge import AutoBridge
+
+                bridge = megatron_bridge_utils.patch_auto_bridge_hf_config(
+                    AutoBridge.from_hf_pretrained(load_path, trust_remote_code=True)
+                )
+            if use_mbridge:
+                bridge.load_weights(ddp_model, load_path, memory_efficient=True)
+            else:
+                bridge.load_hf_weights(ddp_model)
     elif args.megatron_to_hf_mode == "raw":
         logger.info(f"Load HF checkpoint into Megatron via raw mode (path={load_path})")
-        from transformers import AutoModelForCausalLM
+        # Try mbridge first (handles name mapping correctly)
+        try:
+            import slime_plugins.megatron_bridge  # noqa: F401
+            from mbridge import AutoBridge as MbBridge
 
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            load_path, torch_dtype="auto", low_cpu_mem_usage=True, trust_remote_code=True,
-        )
-        # Copy HF state dict to Megatron model parameters (matched by name).
-        # Only weights from the HF model that exist in the Megatron model
-        # are copied (the Megatron model may have extra TP-sharded params).
-        hf_sd = hf_model.state_dict()
-        model = megatron_bridge_utils.unwrap_model(ddp_model)[0]
-        missing, unexpected = model.load_state_dict(hf_sd, strict=False)
-        if missing:
-            logger.info("Raw load: %d missing keys (e.g. TP-sharded params)", len(missing))
-        if unexpected:
-            logger.info("Raw load: %d unexpected keys (ignored)", len(unexpected))
-        logger.info("Raw load: loaded %d HF weight tensors", len(hf_sd))
-        del hf_model, hf_sd
+            bridge = megatron_bridge_utils.patch_auto_bridge_hf_config(
+                MbBridge.from_hf_pretrained(load_path, trust_remote_code=True)
+            )
+            bridge.load_weights(ddp_model, load_path, memory_efficient=True)
+            logger.info("Raw load: using mbridge.AutoBridge for correct name mapping")
+        except Exception:
+            logger.info("mbridge not available, falling back to direct state_dict copy")
+            from transformers import AutoModelForCausalLM
+
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                load_path, torch_dtype="auto", low_cpu_mem_usage=True, trust_remote_code=True,
+            )
+            # Copy HF state dict to Megatron model parameters (matched by name).
+            # Only weights from the HF model that exist in the Megatron model
+            # are copied (the Megatron model may have extra TP-sharded params).
+            hf_sd = hf_model.state_dict()
+            model = megatron_bridge_utils.unwrap_model(ddp_model)[0]
+            missing, unexpected = model.load_state_dict(hf_sd, strict=False)
+            if missing:
+                logger.info("Raw load: %d missing keys (e.g. TP-sharded params)", len(missing))
+            if unexpected:
+                logger.info("Raw load: %d unexpected keys (ignored)", len(unexpected))
+            logger.info("Raw load: loaded %d HF weight tensors", len(hf_sd))
+            del hf_model, hf_sd
     else:
         raise ValueError(f"Unknown megatron_to_hf_mode: {args.megatron_to_hf_mode!r}")
 
