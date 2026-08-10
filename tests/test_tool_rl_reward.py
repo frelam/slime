@@ -395,3 +395,214 @@ class TestBuildRmUserMessage:
         )
         assert "Agent Response (to evaluate)" in msg
         assert "Output your evaluation as a JSON object" in msg
+
+
+# ============================================================================
+# compute_tool_rl_reward — no-tools-needed label semantics
+# ============================================================================
+
+
+class TestComputeToolRlReward:
+    """End-to-end reward composition for label mode."""
+
+    @staticmethod
+    def _tools() -> list[dict]:
+        return [
+            {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        ]
+
+    def test_no_tool_label_and_no_calls_scores_full(self):
+        import asyncio
+
+        from examples.tool_rl.reward.reward import compute_tool_rl_reward
+
+        class Args:
+            reward_weights = None
+
+        traj = [
+            _make_trajectory_record(text="<think>No tools are needed here.</think>"),
+        ]
+        breakdown = asyncio.run(
+            compute_tool_rl_reward(
+                Args(),
+                traj,
+                "Task that needs no tool call",
+                available_tools=self._tools(),
+                ground_truth_calls=[],
+            )
+        )
+
+        assert breakdown.tool_correctness == pytest.approx(1.0)
+        assert breakdown.format_compliance == pytest.approx(1.0)
+        assert breakdown.tool_call_format == pytest.approx(1.0)
+        assert breakdown.total == pytest.approx(1.0)
+
+    def test_exact_label_call_with_extra_schema_params_scores_full(self):
+        import asyncio
+
+        from examples.tool_rl.reward.reward import compute_tool_rl_reward
+
+        class Args:
+            reward_weights = None
+
+        tools = [
+            {
+                "name": "top_popular_posts",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "time": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                },
+            },
+        ]
+        text = (
+            "<think>I need the monthly popular posts.</think>\n"
+            "<tool_call>\n"
+            "<function=top_popular_posts>\n"
+            '<parameter=time>"month"</parameter>\n'
+            "</function>\n"
+            "</tool_call>"
+        )
+        traj = [_make_trajectory_record(text=text)]
+        breakdown = asyncio.run(
+            compute_tool_rl_reward(
+                Args(),
+                traj,
+                "Get top popular posts this month",
+                available_tools=tools,
+                ground_truth_calls=[
+                    {"name": "top_popular_posts", "arguments": {"time": "month"}},
+                ],
+            )
+        )
+
+        assert breakdown.tool_correctness == pytest.approx(1.0)
+        assert breakdown.format_compliance == pytest.approx(1.0)
+        assert breakdown.tool_call_format == pytest.approx(1.0)
+        assert breakdown.total == pytest.approx(1.0)
+
+    def test_json_array_string_label_matches_list_output(self):
+        import asyncio
+
+        from examples.tool_rl.reward.reward import compute_tool_rl_reward
+
+        class Args:
+            reward_weights = None
+
+        tools = [
+            {
+                "name": "feedback_time_series",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "start_date": {"type": "string"},
+                        "end_date": {"type": "string"},
+                        "sessions": {"type": "array"},
+                        "time_intervals": {"type": "array"},
+                    },
+                },
+            },
+        ]
+        text = (
+            "<think>I need the weekly feedback time series.</think>\n"
+            "<tool_call>\n"
+            "<function=feedback_time_series>\n"
+            '<parameter=start_date>"2023-01-01"</parameter>\n'
+            '<parameter=end_date>"2023-03-31"</parameter>\n'
+            '<parameter=sessions>["session1", "session2", "session3"]</parameter>\n'
+            '<parameter=time_intervals>["weekly"]</parameter>\n'
+            "</function>\n"
+            "</tool_call>"
+        )
+        traj = [_make_trajectory_record(text=text)]
+        breakdown = asyncio.run(
+            compute_tool_rl_reward(
+                Args(),
+                traj,
+                "Get feedback time series",
+                available_tools=tools,
+                ground_truth_calls=[
+                    {
+                        "name": "feedback_time_series",
+                        "arguments": {
+                            "start_date": "2023-01-01",
+                            "end_date": "2023-03-31",
+                            "sessions": '["session1", "session2", "session3"]',
+                            "time_intervals": '["weekly"]',
+                        },
+                    },
+                ],
+            )
+        )
+
+        assert breakdown.name_score == pytest.approx(1.0)
+        assert breakdown.param_content_score == pytest.approx(1.0)
+        assert breakdown.tool_correctness == pytest.approx(1.0)
+        assert breakdown.total == pytest.approx(1.0)
+
+    def test_multiple_exact_calls_with_extra_schema_params_scores_full(self):
+        import asyncio
+
+        from examples.tool_rl.reward.reward import compute_tool_rl_reward
+
+        class Args:
+            reward_weights = None
+
+        tools = [
+            {
+                "name": "stock_cashflow_statement",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": {"type": "string"},
+                        "period": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                },
+            },
+            {
+                "name": "news_v2_list_trending",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"size": {"type": "integer"}},
+                },
+            },
+        ]
+        text = (
+            "<think>I need cash flow and trending news.</think>\n"
+            "<tool_call>\n"
+            "<function=stock_cashflow_statement>\n"
+            '<parameter=symbol>"TSLA"</parameter>\n'
+            "</function>\n"
+            "</tool_call>\n"
+            "<tool_call>\n"
+            "<function=news_v2_list_trending>\n"
+            "<parameter=size>10</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        traj = [_make_trajectory_record(text=text)]
+        breakdown = asyncio.run(
+            compute_tool_rl_reward(
+                Args(),
+                traj,
+                "Get TSLA cash flow and top trending news",
+                available_tools=tools,
+                ground_truth_calls=[
+                    {"name": "stock_cashflow_statement", "arguments": {"symbol": "TSLA"}},
+                    {"name": "news_v2_list_trending", "arguments": {"size": 10}},
+                ],
+            )
+        )
+
+        assert breakdown.tool_correctness == pytest.approx(1.0)
+        assert breakdown.tool_call_format == pytest.approx(1.0)
+        assert breakdown.total == pytest.approx(1.0)

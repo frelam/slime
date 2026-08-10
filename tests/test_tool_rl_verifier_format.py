@@ -27,10 +27,32 @@ def _traj(text: str) -> list[dict]:
     return [{"turn": 0, "text": text, "finish_reason": "stop", "type": "turn"}]
 
 
-def _format_score(text: str, tools: list[dict] | None = TOOLS) -> float:
+def _format_score(
+    text: str,
+    tools: list[dict] | None = TOOLS,
+    expects_no_tools: bool = False,
+) -> float:
     from examples.tool_rl.reward.verifier import check_format_compliance
 
-    return check_format_compliance(_traj(text), available_tools=tools)
+    return check_format_compliance(
+        _traj(text),
+        available_tools=tools,
+        expects_no_tools=expects_no_tools,
+    )
+
+
+def _tool_call_format_score(
+    text: str,
+    tools: list[dict] | None = TOOLS,
+    expects_no_tools: bool = False,
+) -> float:
+    from examples.tool_rl.reward.verifier import check_tool_call_format
+
+    return check_tool_call_format(
+        _traj(text),
+        tools,
+        expects_no_tools=expects_no_tools,
+    )
 
 
 def _xml_call(name: str = "get_weather", value: str = '"Beijing"') -> str:
@@ -151,6 +173,93 @@ class TestNoTools:
     def test_no_calls_with_tools_zero(self):
         text = "<think>nothing to do</think>"
         assert _format_score(text, tools=TOOLS) == pytest.approx(0.0)
+
+    def test_no_calls_with_tools_full_when_label_expects_none(self):
+        """gt=[] means no tools needed — emitting no calls is valid format."""
+        text = "<think>nothing to do</think>"
+        assert _format_score(text, tools=TOOLS, expects_no_tools=True) == pytest.approx(1.0)
+
+    def test_empty_block_with_tools_full_when_label_expects_none(self):
+        """Empty blocks are not calls; with a no-tool label they don't fail."""
+        text = "<think>nothing to do</think>\n<tool_call></tool_call>"
+        assert _format_score(text, tools=TOOLS, expects_no_tools=True) == pytest.approx(1.0)
+
+
+class TestToolCallFormatNoToolsExpected:
+    def test_no_calls_with_tools_zero_by_default(self):
+        assert _tool_call_format_score("<think>x</think>") == pytest.approx(0.0)
+
+    def test_no_calls_full_when_label_expects_none(self):
+        assert _tool_call_format_score(
+            "<think>x</think>", expects_no_tools=True,
+        ) == pytest.approx(1.0)
+
+    def test_actual_calls_still_validated_when_label_expects_none(self):
+        """A no-tool label doesn't disable Dim 3 if the model calls anyway."""
+        text = "<think>x</think>\n" + _xml_call()
+        assert _tool_call_format_score(text, expects_no_tools=True) == pytest.approx(1.0)
+
+        unknown = "<think>x</think>\n" + _xml_call(name="not_a_tool")
+        assert _tool_call_format_score(unknown, expects_no_tools=True) == pytest.approx(0.0)
+
+
+class TestToolCallFormatParamNames:
+    """Dim 3 must not penalize omitting optional schema parameters."""
+
+    @staticmethod
+    def _two_param_tools() -> list[dict]:
+        return [
+            {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string"},
+                    },
+                },
+            },
+        ]
+
+    def test_matching_subset_of_optional_params_full(self):
+        """A call that matches the label (only `city`) should get Dim 3 = 1.0."""
+        text = "<think>x</think>\n" + _xml_call()
+        assert _tool_call_format_score(
+            text, tools=self._two_param_tools(),
+        ) == pytest.approx(1.0)
+
+    def test_undeclared_param_still_penalized(self):
+        text = (
+            "<think>x</think>\n"
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            '<parameter=city>"Beijing"</parameter>\n'
+            '<parameter=bogus>"x"</parameter>\n'
+            "</function>\n"
+            "</tool_call>"
+        )
+        assert _tool_call_format_score(
+            text, tools=self._two_param_tools(),
+        ) == pytest.approx(0.75)
+
+
+class TestValuesMatch:
+    """JSON-encoded array/object strings are semantically equal to values."""
+
+    def test_json_encoded_array_string_matches_list(self):
+        from examples.tool_rl.reward.verifier import _values_match
+
+        assert _values_match('["session1", "session2"]', ["session1", "session2"])
+
+    def test_json_encoded_array_strings_match_each_other(self):
+        from examples.tool_rl.reward.verifier import _values_match
+
+        assert _values_match('["session1", "session2"]', '["session1", "session2"]')
+
+    def test_json_encoded_object_string_matches_dict(self):
+        from examples.tool_rl.reward.verifier import _values_match
+
+        assert _values_match('{"a": 1}', {"a": 1})
 
 
 # ============================================================================

@@ -18,7 +18,8 @@ Dimensions
   Scoring:
     1. All tool_calls after a single, non-empty <think> → +0.6
     2. Each tool_call preceded by a non-empty <think> → +0.4 × 1/N
-    3. No tools used → 1.0
+    3. No calls → 1.0 when no tools are expected (label says no tools
+       needed, or no tools are defined), otherwise 0.0
 
   The <think> block must appear exactly once with non-empty content for
   full credit — an empty or repeated <think> is not valid reasoning.
@@ -30,7 +31,8 @@ Dimensions
     1. Tool name correct + no undeclared tools → +1/N × 0.5
     2. Param name correct + no undeclared params → +1/N × 0.3
     3. Param type correct → +1/N × 0.2
-    4. No tools used → 1.0
+    4. No calls → 1.0 when no tools are expected (label says no tools
+       needed, or no tools are defined), otherwise 0.0
 """
 
 from __future__ import annotations
@@ -137,13 +139,15 @@ def check_format_compliance(
     trajectory: list[dict[str, Any]],
     *,
     available_tools: list[dict[str, Any]] | None = None,
+    expects_no_tools: bool = False,
 ) -> float:
     """Check <think>...<tool_call> format compliance.
 
     Scoring:
       1. All tool_calls after a single, non-empty <think> block → +0.6
       2. Each tool_call preceded by a non-empty <think> → +0.4 × count/N
-      3. No tools → 0.0 if tools are defined, 1.0 if no tools at all
+      3. No calls → 1.0 when no tools are expected (label says no tools
+         needed, or no tools are defined), otherwise 0.0 if tools are defined
 
     Full credit requires the think block to appear exactly once with
     non-empty content — an empty or repeated ``<think>`` is not valid
@@ -154,6 +158,7 @@ def check_format_compliance(
     Args:
         trajectory: Normalized trajectory.
         available_tools: Tool definitions. If non-empty and no calls, score 0.
+        expects_no_tools: Label says no tools are needed for this task.
 
     Returns:
         Score in [0.0, 1.0].
@@ -163,11 +168,12 @@ def check_format_compliance(
     n_calls += len(_find_json_tool_call_spans(all_text))
 
     if n_calls == 0:
-        if available_tools:
-            logger.debug("[dim2] No tool calls but tools available → 0.0")
-            return 0.0
-        logger.debug("[dim2] No tool calls, no tools defined → 1.0")
-        return 1.0
+        if expects_no_tools or not available_tools:
+            reason = "label says no tools needed" if expects_no_tools else "no tools defined"
+            logger.debug("[dim2] No tool calls and %s → 1.0", reason)
+            return 1.0
+        logger.debug("[dim2] No tool calls but tools available → 0.0")
+        return 0.0
 
     score = 0.0
 
@@ -279,6 +285,7 @@ def _count_preceded_by_think(text: str, total: int) -> int:
 def check_tool_call_format(
     trajectory: list[dict[str, Any]],
     available_tools: list[dict[str, Any]] | None = None,
+    expects_no_tools: bool = False,
 ) -> float:
     """Check tool call name, param name, param type correctness.
 
@@ -286,11 +293,13 @@ def check_tool_call_format(
       1. Name correct + not undeclared → +1/N × 0.5
       2. Param name correct + not undeclared → +1/N × 0.3
       3. Param type correct → +1/N × 0.2
-      4. No tools → 0.0 if tools are defined, 1.0 if no tools at all
+      4. No calls → 1.0 when no tools are expected (label says no tools
+         needed, or no tools are defined), otherwise 0.0 if tools are defined
 
     Args:
         trajectory: Normalized trajectory.
         available_tools: Tool definitions. If non-empty and no calls, score 0.
+        expects_no_tools: Label says no tools are needed for this task.
 
     Returns:
         Score in [0.0, 1.0].
@@ -299,11 +308,12 @@ def check_tool_call_format(
     parsed = parse_qwen_tool_calls(all_text)
 
     if not parsed:
-        if available_tools:
-            logger.debug("[dim3] No tool calls but tools available → 0.0")
-            return 0.0
-        logger.debug("[dim3] No tool calls, no tools defined → 1.0")
-        return 1.0
+        if expects_no_tools or not available_tools:
+            reason = "label says no tools needed" if expects_no_tools else "no tools defined"
+            logger.debug("[dim3] No tool calls and %s → 1.0", reason)
+            return 1.0
+        logger.debug("[dim3] No tool calls but tools available → 0.0")
+        return 0.0
 
     n = len(parsed)
     available = available_tools or []
@@ -330,10 +340,12 @@ def check_tool_call_format(
             declared_names = set(declared.keys())
 
             if declared_names and cargs:
-                # Param name: fraction of declared params present + no extra
+                # Param name: fraction of provided params that are declared.
+                # Missing optional schema params are not penalized — the
+                # label match already covers whether a param was required.
                 matched = sum(1 for k in cargs if k in declared_names)
                 extra = sum(1 for k in cargs if k not in declared_names)
-                pname_acc += matched / max(len(declared_names), len(cargs))
+                pname_acc += matched / max(len(cargs), 1)
                 if extra:
                     logger.debug("[dim3] Extra params for %r: %s",
                                  cname, [k for k in cargs if k not in declared_names])
@@ -551,7 +563,15 @@ def get_incorrect_tool_call_spans(
 
 
 def _values_match(v1: Any, v2: Any) -> bool:
-    """Check value equality with some fuzziness for strings."""
+    """Check value equality with some fuzziness for strings.
+
+    A JSON-encoded string (e.g. a label parameter stored as
+    ``'["session1", ...]'``) is treated as equivalent to the decoded
+    structured value (``["session1", ...]``).
+    """
+    v1 = _unwrap_json_string(v1)
+    v2 = _unwrap_json_string(v2)
+
     if v1 is v2 or type(v1) == type(v2) and v1 == v2:
         return True
     if v1 is None or v2 is None:
@@ -569,6 +589,18 @@ def _values_match(v1: Any, v2: Any) -> bool:
     if isinstance(v1, list) and isinstance(v2, list) and len(v1) == len(v2):
         return all(_values_match(a, b) for a, b in zip(v1, v2))
     return False
+
+
+def _unwrap_json_string(value: Any) -> Any:
+    """Decode a string that wraps a JSON array/object into the structured value."""
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return value
+        if isinstance(decoded, (dict, list)):
+            return decoded
+    return value
 
 
 def _param_content_score(
@@ -757,17 +789,27 @@ def compute_verifier_scores(
     trajectory: list[dict[str, Any]],
     *,
     available_tools: list[dict[str, Any]] | None = None,
+    expects_no_tools: bool = False,
 ) -> dict[str, float]:
     """Compute Dim 2 + Dim 3 verifier scores.
 
     Args:
         trajectory: Normalized trajectory.
         available_tools: Tool definitions for Dim 3 format check.
+        expects_no_tools: Label says no tools are needed for this task.
 
     Returns:
         ``{"format_compliance": float, "tool_call_format": float}``.
     """
     return {
-        "format_compliance": check_format_compliance(trajectory, available_tools=available_tools),
-        "tool_call_format": check_tool_call_format(trajectory, available_tools),
+        "format_compliance": check_format_compliance(
+            trajectory,
+            available_tools=available_tools,
+            expects_no_tools=expects_no_tools,
+        ),
+        "tool_call_format": check_tool_call_format(
+            trajectory,
+            available_tools,
+            expects_no_tools=expects_no_tools,
+        ),
     }

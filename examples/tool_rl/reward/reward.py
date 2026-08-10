@@ -178,19 +178,25 @@ async def compute_tool_rl_reward(
 
     weights = get_weights(args)
 
-    # ── Dim 2 + Dim 3: Verifier (rule-based, always on) ──
-    verifier = compute_verifier_scores(trajectory, available_tools=available_tools)
-    format_score = verifier["format_compliance"]
-    tool_call_score = verifier["tool_call_format"]
+    # has_gt distinguishes: None (no label) vs [] (label says "no tools needed")
+    has_gt = ground_truth_calls is not None
+    parsed_gt = parse_ground_truth_calls(ground_truth_calls)
 
     # Parse the model's tool calls from trajectory text
     all_text = "\n".join(r.get("text", "") for r in trajectory if r.get("type") != "observation")
     output_calls = parse_qwen_tool_calls(all_text)
 
-    # ── Dim 1: Tool Call Correctness ────────────────────
-    # has_gt distinguishes: None (no label) vs [] (label says "no tools needed")
-    has_gt = ground_truth_calls is not None
-    parsed_gt = parse_ground_truth_calls(ground_truth_calls)
+    # ── Dim 2 + Dim 3: Verifier (rule-based, always on) ──
+    # When the label says no tools are needed, correctly emitting no calls
+    # is valid format (and not an "empty output hack"), so the no-call
+    # penalty is skipped.
+    verifier = compute_verifier_scores(
+        trajectory,
+        available_tools=available_tools,
+        expects_no_tools=has_gt and not parsed_gt,
+    )
+    format_score = verifier["format_compliance"]
+    tool_call_score = verifier["tool_call_format"]
 
     if has_gt:
         # ── Label mode: rule-based matching ──
