@@ -57,7 +57,6 @@ Benchmark 评测 (Auto-benchmark-analyze) — OpenI 平台 Python 入口
 """
 
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -187,7 +186,12 @@ def resolve_model_dir() -> tuple[str, str, str | None]:
 
 
 def _find_mounted_model() -> str | None:
-    """在平台挂载目录里找 HF 模型 (根含 config.json / hf_base/ / 含 safetensors)。"""
+    """在平台挂载目录里找可评测的 HF 模型 (config.json + 权重文件)。
+
+    仅含 config/tokenizer 的目录 (如 slime 训练产物的 hf_base 模板, 权重在
+    iter_*/ 的 Megatron 分片里) 视为无效, 跳过。全部无效时返回 None,
+    由调用方回退默认模型目录。
+    """
     base = resolve_pretrain_base()
     if not os.path.isdir(base):
         return None
@@ -203,9 +207,10 @@ def _find_mounted_model() -> str | None:
             if os.path.isdir(s) and os.path.isfile(os.path.join(s, "config.json")):
                 candidates.append(s)
     for c in candidates:
-        if any(f.endswith(".safetensors") for f in os.listdir(c)):
+        # 权重必须真实存在 (safetensors 或 pytorch bin), 否则 SGLang 起不来
+        if any(f.endswith((".safetensors", ".bin")) for f in os.listdir(c)):
             return c
-    return candidates[0] if candidates else None
+    return None  # 挂载里没有完整 HF 权重 → 回退默认模型
 
 
 # --------------------------------------------------------------------------
@@ -294,7 +299,7 @@ def launch_sglang(model_dir: str, chat_template: str | None, port: int) -> subpr
         "--max-running-requests", "64",
         "--chunked-prefill-size", "512",
         "--max-prefill-tokens", "1024",
-        "--attention-backend", "triton",
+        "--attention-backend", "torch_native",
         "--sampling-backend", "pytorch",
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
