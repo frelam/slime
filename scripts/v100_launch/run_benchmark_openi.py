@@ -25,17 +25,17 @@ Benchmark 评测 (Auto-benchmark-analyze) — OpenI 平台 Python 入口
     必须收到 chat 格式输入; 接口仍走 /v1/completions (MC 任务的
     loglikelihood 打分依赖 echo+logprobs, chat 接口没有 prompt logprobs)。
     设为 0 关闭 (裸 prompt 评测, 与旧行为一致)。
-  * thinking 控制 (THINKING, 默认 0=关闭): Qwen3 系模板的 <think> 思考块
-    会混进生成输出, humaneval 代码提取被截断/污染、ifeval 校验受干扰。
-    THINKING=0 时用模板的 enable_thinking 变量 (false => 空 think 块,
-    Qwen3 官方关闭思考信号), 模型直接给答案; 评测 tokenizer 用模型目录的
-    副本 (只拷 tokenizer 文件, 不改原模型), 模板默认值改为关闭思考。
-    THINKING=1 保留思考 (任务层需自行剥离 think 块)。
-  * humaneval chat 适配 (自动 venv patch, 幂等): Qwen3 chat 模型输出
-    "Here's..." 说明 + ```python 包裹的完整函数; 任务 until 的 \ndef 会截断
-    刚写的 def 签名, filter 拼接 doc.prompt 会混入说明文字。patch: until
-    去掉 \ndef + filter 换 build_predictions_codeblock (提取代码块, 不拼
-    prompt)。实测 pass@1 从 0 到 1.0 (LIMIT=2)。
+  * thinking 控制 (THINKING, 默认 1=保留): 模型训练带 Thinking Mode Guide,
+    思考是能力的一部分, 默认不关。Qwen3 系模板的 <think> 思考块会混进生成
+    输出, humaneval 提取层会自动剥离 <think>...</think> 再取代码块 (见下);
+    gsm8k 的 flexible-extract 天然免疫。THINKING=0 时用模板 enable_thinking
+    变量 (false => 空 think 块, Qwen3 官方关闭思考信号) 让模型直接给答案;
+    评测 tokenizer 用模型目录的副本 (只拷 tokenizer 文件, 不改原模型)。
+  * humaneval chat 适配 (自动 venv patch, 幂等): Qwen3 chat 模型先
+    <think> 推理 + "Here's..." 说明 + ```python 包裹的完整函数; 任务 until
+    的 \ndef 会截断刚写的 def 签名, filter 拼接 doc.prompt 会混入说明文字。
+    patch: until 去掉 \ndef + filter 换 build_predictions_codeblock (剥离
+    think 块 + 提取代码块, 不拼 prompt)。实测 pass@1 0 → 1.0 (LIMIT=2)。
   * SGLang 服务: 参数与本机 V100 实测配置一致 (TP2, torch_native 系,
     disable cuda graph, mem-fraction 0.6, tool-call-parser qwen);
     启动前预检 triton 与 torch 配套 (triton_key ImportError 是 SGLang 启动
@@ -347,15 +347,17 @@ def _patch_aime24_max_gen_toks(site: str) -> None:
 # 不拼 prompt — 模型输出已含完整函数定义)。幂等。
 _HUMANEVAL_CODEBLOCK_FN = (
     "def build_predictions_codeblock(resps, docs):\n"
-    '    """Extract the ```python ... ``` code block from chat-model responses.\n'
+    '    """Extract code from chat-model responses with reasoning.\n'
     "\n"
-    "    Chat/RL models (e.g. Qwen3 with a chat template) preface the code with\n"
-    '    explanation text ("Here\'s the implementation...") and wrap it in a\n'
-    "    ```python fence, and they re-emit the full function signature instead of\n"
-    "    completing the skeleton. Concatenating the raw response to the doc prompt\n"
-    "    yields invalid Python (prose inside the function body). Instead we take the\n"
-    "    fenced block verbatim (it already contains the complete definition), or the\n"
-    "    whole response when no fence is present.\n"
+    "    Chat/RL models (e.g. Qwen3 with a chat template) reason inside\n"
+    "    <think>...</think> blocks before emitting code, preface the code with\n"
+    "    explanation text (\"Here's the implementation...\"), and wrap it in a\n"
+    "    ```python fence, re-emitting the full function signature instead of\n"
+    "    completing the skeleton. Concatenating the raw response to the doc\n"
+    "    prompt yields invalid Python (prose inside the function body), and the\n"
+    "    think block would pollute the candidate. We strip the think block,\n"
+    "    then take the fenced code verbatim (it already contains the complete\n"
+    "    definition), or the whole remainder when no fence is present.\n"
     '    """\n'
     "    import re\n"
     "\n"
@@ -363,6 +365,7 @@ _HUMANEVAL_CODEBLOCK_FN = (
     "    for resp, doc in zip(resps, docs):\n"
     "        cands = []\n"
     "        for r in resp:\n"
+    "            r = re.sub(r\"<think>.*?</think>\", \"\", r, flags=re.DOTALL)\n"
     '            m = re.search(r"```(?:python)?\\s*\\n(.*?)```", r, re.DOTALL)\n'
     "            cands.append(m.group(1).strip() if m else r.strip())\n"
     "        out.append(cands)\n"
@@ -381,29 +384,49 @@ def _patch_humaneval_for_chat(site: str) -> None:
     changed = False
     with open(utils_py, encoding="utf-8") as f:
         utils_text = f.read()
-    if "build_predictions_codeblock" not in utils_text:
-        with open(utils_py, "a", encoding="utf-8") as f:
-            f.write("\n\n" + _HUMANEVAL_CODEBLOCK_FN)
-        _print("[run_benchmark_openi] humaneval/utils.py: 追加 "
-               "build_predictions_codeblock (代码块提取)")
+    if "re.sub(r\"<think>" not in utils_text:
+        # 无函数 → 追加; 有旧版 (无 think 剥离) → 截断重写为新版
+        idx = utils_text.find("def build_predictions_codeblock")
+        if idx != -1:
+            utils_text = utils_text[:idx]
+        with open(utils_py, "w", encoding="utf-8") as f:
+            f.write(utils_text.rstrip() + "\n\n" + _HUMANEVAL_CODEBLOCK_FN)
+        _print("[run_benchmark_openi] humaneval/utils.py: "
+               "build_predictions_codeblock (think 剥离 + 代码块提取)")
         changed = True
     with open(yaml_p, encoding="utf-8") as f:
         yaml_text = f.read()
-    if '\n    - "\\ndef"\n' in yaml_text:
-        yaml_text = yaml_text.replace('\n    - "\\ndef"\n', "\n")
-        changed = True
+    yaml_changed = False
+    # until 整体替换为 <|im_end|> (chat 模型): 代码类 until ("\ndef"/"\nif"/...)
+    # 会命中 think 块的自然语言 ("if any two numbers..."), 生成被截断在 think
+    # 中间 → </think> 缺失 → 剥离失败。Qwen3 EOS 让模型完整输出 think + 代码。
+    import re as _re
+    if '  until:\n    - "<|im_end|>"' not in yaml_text:
+        until_m = _re.search(r"generation_kwargs:\n  until:\n(?:    - .*\n)+",
+                             yaml_text)
+        if until_m:
+            yaml_text = yaml_text.replace(
+                until_m.group(0),
+                'generation_kwargs:\n  until:\n    - "<|im_end|>"\n')
+            yaml_changed = True
+    # max_gen_toks -> 8192: Qwen3 think 可到 1000+ tokens, 默认 1024 会截断在
+    # think 中间 → </think> 缺失 → 提取失败 (实测: 4018 字符仍在 think 中)
+    if "max_gen_toks: 1024" in yaml_text or "max_gen_toks: 2048" in yaml_text:
+        yaml_text = yaml_text.replace("max_gen_toks: 1024", "max_gen_toks: 8192")
+        yaml_text = yaml_text.replace("max_gen_toks: 2048", "max_gen_toks: 8192")
+        yaml_changed = True
     if "build_predictions_codeblock" not in yaml_text:
         yaml_text = yaml_text.replace(
             "filter_fn: !function utils.build_predictions",
             "filter_fn: !function utils.build_predictions_codeblock",
         )
-        changed = True
-    if changed:
+        yaml_changed = True
+    if yaml_changed:
         with open(yaml_p, "w", encoding="utf-8") as f:
             f.write(yaml_text)
-        _print("[run_benchmark_openi] humaneval.yaml: 去掉 \\ndef until, "
+        _print("[run_benchmark_openi] humaneval.yaml: until -> <|im_end|>, "
                "filter -> build_predictions_codeblock (chat 适配)")
-    else:
+    elif changed:
         _print("[run_benchmark_openi] humaneval.yaml: 已 patch (幂等)")
 
 
@@ -635,7 +658,7 @@ evaluation:
   limit: {limit or 'null'}
   output_dir: {os.path.join(output_dir, 'eval_runs')}
   tokenizer: {os.environ.get('EVAL_TOKENIZER_DIR', model_dir)}
-  max_gen_toks: 1024
+  max_gen_toks: 8192
   num_concurrent: 16
   max_length: {max_length}
   confirm_run_unsafe_code: true
@@ -731,8 +754,10 @@ def main() -> None:
     venv_python, _site = ensure_benchmark_env()
     model_dir, model_name, chat_template = resolve_model_dir()
 
-    # 评测 tokenizer: THINKING=0 (默认) 生成关思考的模板副本
-    thinking = os.environ.get("THINKING", "0") != "0"
+    # 评测 tokenizer: THINKING=1 (默认) 保留思考 (模型训练带 Thinking Mode
+    # Guide, 思考是能力的一部分); think 块在 humaneval 提取层剥离。
+    # THINKING=0 时生成关思考的模板副本 (空 think 块信号, 模型直接给答案)。
+    thinking = os.environ.get("THINKING", "1") != "0"
     eval_tok = make_eval_tokenizer(model_dir, thinking)
     os.environ["EVAL_TOKENIZER_DIR"] = eval_tok
     _print(f"[run_benchmark_openi] 评测 tokenizer: {eval_tok} "
