@@ -19,6 +19,23 @@ Benchmark 评测 (Auto-benchmark-analyze) — OpenI 平台 Python 入口
     /root/models/Qwen3-4B-tool-rl (镜像内模型)。评测用 OpenAI 兼容
     endpoint, 不需要 torch GPU 环境 — 服务用 slime env python 起 SGLang,
     评测用评测 venv python (纯 HTTP 客户端)。
+  * chat 模板 (APPLY_CHAT_TEMPLATE, 默认 1): 评测 prompt 用模型目录的
+    chat_template.jinja 套成 chat 格式后再发 (lm-eval --apply_chat_template,
+    local-completions + 客户端模板)。chat/RL 训练的模型对裸 prompt 退化,
+    必须收到 chat 格式输入; 接口仍走 /v1/completions (MC 任务的
+    loglikelihood 打分依赖 echo+logprobs, chat 接口没有 prompt logprobs)。
+    设为 0 关闭 (裸 prompt 评测, 与旧行为一致)。
+  * thinking 控制 (THINKING, 默认 0=关闭): Qwen3 系模板的 <think> 思考块
+    会混进生成输出, humaneval 代码提取被截断/污染、ifeval 校验受干扰。
+    THINKING=0 时用模板的 enable_thinking 变量 (false => 空 think 块,
+    Qwen3 官方关闭思考信号), 模型直接给答案; 评测 tokenizer 用模型目录的
+    副本 (只拷 tokenizer 文件, 不改原模型), 模板默认值改为关闭思考。
+    THINKING=1 保留思考 (任务层需自行剥离 think 块)。
+  * humaneval chat 适配 (自动 venv patch, 幂等): Qwen3 chat 模型输出
+    "Here's..." 说明 + ```python 包裹的完整函数; 任务 until 的 \ndef 会截断
+    刚写的 def 签名, filter 拼接 doc.prompt 会混入说明文字。patch: until
+    去掉 \ndef + filter 换 build_predictions_codeblock (提取代码块, 不拼
+    prompt)。实测 pass@1 从 0 到 1.0 (LIMIT=2)。
   * SGLang 服务: 参数与本机 V100 实测配置一致 (TP2, torch_native 系,
     disable cuda graph, mem-fraction 0.6, tool-call-parser qwen);
     启动前预检 triton 与 torch 配套 (triton_key ImportError 是 SGLang 启动
@@ -55,13 +72,14 @@ Benchmark 评测 (Auto-benchmark-analyze) — OpenI 平台 Python 入口
   SGLANG_START / SGLANG_LOG / CUDA_VISIBLE_DEVICES / PYPI_MIRROR /
   GIT_CLONE_URL / OUTPUT_DIR / OUTPUT_SYNC / OUTPUT_SYNC_UPLOAD_OUTPUT /
   HF_ENDPOINT / HF_ALLOW_CODE_EVAL / INSTALL_DEPS / TRITON_AUTOFIX /
-  TRITON_VERSION
+  TRITON_VERSION / APPLY_CHAT_TEMPLATE / THINKING
 
 退出码: 与 benchmark-diagnosis 一致; 编排异常统一 FATAL 退出 1。
 """
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -91,7 +109,7 @@ CONFIG_KEYS = {
     "SGLANG_START", "SGLANG_LOG", "CUDA_VISIBLE_DEVICES", "PYPI_MIRROR",
     "GIT_CLONE_URL", "OUTPUT_DIR", "OUTPUT_SYNC", "OUTPUT_SYNC_UPLOAD_OUTPUT",
     "HF_ENDPOINT", "HF_ALLOW_CODE_EVAL", "INSTALL_DEPS",
-    "TRITON_AUTOFIX", "TRITON_VERSION",
+    "TRITON_AUTOFIX", "TRITON_VERSION", "APPLY_CHAT_TEMPLATE", "THINKING",
 }
 
 PYPI_MIRROR = os.environ.get("PYPI_MIRROR", "https://mirrors.aliyun.com/pypi/simple/")
@@ -299,6 +317,7 @@ def ensure_benchmark_env() -> tuple[str, str]:
         sys.exit(1)
 
     _patch_aime24_max_gen_toks(site)
+    _patch_humaneval_for_chat(site)
     return venv_python, site
 
 
@@ -315,6 +334,135 @@ def _patch_aime24_max_gen_toks(site: str) -> None:
     with open(p, "w", encoding="utf-8") as f:
         f.write(text.replace("max_gen_toks: 32768", "max_gen_toks: 1024"))
     _print("[run_benchmark_openi] aime24.yaml: max_gen_toks 32768 -> 1024 (已 patch)")
+
+
+# humaneval chat 适配 (2026-08-20 实测): Qwen3 chat 模型在套 chat 模板后
+# 会先输出 "Here's the implementation..." 说明 + ```python 包裹的完整函数
+# (重新输出 def 签名, 而不是补全 skeleton)。两个问题:
+#  1) 任务 until 含 "\ndef" → 模型刚写 def 签名就被截断, 函数体不生成;
+#  2) filter build_predictions 把 doc.prompt + 原始输出拼接 → 说明文字和
+#     ```python 围栏混进源码, SyntaxError, pass@1 恒 0。
+# 修复: until 去掉 "\ndef" (实测函数体无裸 "\ndef" 触发, 且 ``` 收尾),
+# filter 换 build_predictions_codeblock (提取 ```python 块, 无块用全文,
+# 不拼 prompt — 模型输出已含完整函数定义)。幂等。
+_HUMANEVAL_CODEBLOCK_FN = (
+    "def build_predictions_codeblock(resps, docs):\n"
+    '    """Extract the ```python ... ``` code block from chat-model responses.\n'
+    "\n"
+    "    Chat/RL models (e.g. Qwen3 with a chat template) preface the code with\n"
+    '    explanation text ("Here\'s the implementation...") and wrap it in a\n'
+    "    ```python fence, and they re-emit the full function signature instead of\n"
+    "    completing the skeleton. Concatenating the raw response to the doc prompt\n"
+    "    yields invalid Python (prose inside the function body). Instead we take the\n"
+    "    fenced block verbatim (it already contains the complete definition), or the\n"
+    "    whole response when no fence is present.\n"
+    '    """\n'
+    "    import re\n"
+    "\n"
+    "    out = []\n"
+    "    for resp, doc in zip(resps, docs):\n"
+    "        cands = []\n"
+    "        for r in resp:\n"
+    '            m = re.search(r"```(?:python)?\\s*\\n(.*?)```", r, re.DOTALL)\n'
+    "            cands.append(m.group(1).strip() if m else r.strip())\n"
+    "        out.append(cands)\n"
+    "    return out\n"
+)
+
+
+def _patch_humaneval_for_chat(site: str) -> None:
+    """venv 内 humaneval 适配 chat 模型 (去 \ndef until + 代码块提取)。幂等。"""
+    base = os.path.join(site, "lm_eval", "tasks", "humaneval")
+    utils_py = os.path.join(base, "utils.py")
+    yaml_p = os.path.join(base, "humaneval.yaml")
+    if not (os.path.isfile(utils_py) and os.path.isfile(yaml_p)):
+        _print("[run_benchmark_openi] WARNING: 未找到 humaneval 任务文件, 跳过 patch")
+        return
+    changed = False
+    with open(utils_py, encoding="utf-8") as f:
+        utils_text = f.read()
+    if "build_predictions_codeblock" not in utils_text:
+        with open(utils_py, "a", encoding="utf-8") as f:
+            f.write("\n\n" + _HUMANEVAL_CODEBLOCK_FN)
+        _print("[run_benchmark_openi] humaneval/utils.py: 追加 "
+               "build_predictions_codeblock (代码块提取)")
+        changed = True
+    with open(yaml_p, encoding="utf-8") as f:
+        yaml_text = f.read()
+    if '\n    - "\\ndef"\n' in yaml_text:
+        yaml_text = yaml_text.replace('\n    - "\\ndef"\n', "\n")
+        changed = True
+    if "build_predictions_codeblock" not in yaml_text:
+        yaml_text = yaml_text.replace(
+            "filter_fn: !function utils.build_predictions",
+            "filter_fn: !function utils.build_predictions_codeblock",
+        )
+        changed = True
+    if changed:
+        with open(yaml_p, "w", encoding="utf-8") as f:
+            f.write(yaml_text)
+        _print("[run_benchmark_openi] humaneval.yaml: 去掉 \\ndef until, "
+               "filter -> build_predictions_codeblock (chat 适配)")
+    else:
+        _print("[run_benchmark_openi] humaneval.yaml: 已 patch (幂等)")
+
+
+# --------------------------------------------------------------------------
+# 评测 tokenizer (chat 模板 + thinking 控制)
+# --------------------------------------------------------------------------
+# Qwen3 系模板的思考块 (think) 会混进生成输出: humaneval 的代码提取被
+# <think> 截断/污染, ifeval 的指令校验也会被干扰。模板自带 enable_thinking
+# 变量 (false 时输出空 <think></think> 占位 = 官方关闭思考的标准信号)。
+# THINKING=0 (默认) 时生成一份评测专用 tokenizer 副本, 把模板默认值改为
+# 关闭思考, 模型直接给答案; THINKING=1 保留思考 (需任务层自行剥离 think)。
+# 副本只含 tokenizer 相关文件 (几十 MB), 不改原模型目录; SGLang 服务端
+# --chat-template 仍用原模板 (评测 prompt 是客户端套好的, 服务端模板无关)。
+_THINK_OLD = "enable_thinking is defined and enable_thinking is false"
+_THINK_NEW = "enable_thinking is not defined or enable_thinking is false"
+
+
+def _eval_tokenizer_dir() -> str:
+    return os.path.join(BENCHMARK_ROOT, "logs", "eval_tokenizer")
+
+
+def make_eval_tokenizer(model_dir: str, thinking: bool) -> str:
+    """生成评测专用 tokenizer 目录 (关思考模板副本), 返回其路径。
+
+    thinking=True 时直接返回 model_dir (不复制)。幂等: 模板已 patch 过则跳过。
+    """
+    if thinking:
+        return model_dir
+    dst = _eval_tokenizer_dir()
+    os.makedirs(dst, exist_ok=True)
+    tok_files = [
+        "tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+        "chat_template.jinja", "special_tokens_map.json", "added_tokens.json",
+        "config.json", "generation_config.json", "merges.txt", "vocab.json",
+    ]
+    copied = False
+    for fn in tok_files:
+        src = os.path.join(model_dir, fn)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(dst, fn))
+            copied = True
+    if not copied:
+        _print(f"[run_benchmark_openi] WARNING: 模型目录没有 tokenizer 文件, "
+               f"tokenizer 副本不完整: {model_dir}")
+    jpath = os.path.join(dst, "chat_template.jinja")
+    if os.path.isfile(jpath):
+        with open(jpath, encoding="utf-8") as f:
+            text = f.read()
+        if _THINK_OLD in text:
+            with open(jpath, "w", encoding="utf-8") as f:
+                f.write(text.replace(_THINK_OLD, _THINK_NEW))
+            _print("[run_benchmark_openi] 评测 tokenizer: chat_template 默认关闭 "
+                   "思考 (enable_thinking 未定义 => 空 <think> 块)")
+        else:
+            _print("[run_benchmark_openi] 评测 tokenizer: 模板已处理 (幂等)")
+    else:
+        _print(f"[run_benchmark_openi] WARNING: 副本无 chat_template.jinja, "
+               f"thinking 开关不生效: {jpath}")
+    return dst
 
 
 # --------------------------------------------------------------------------
@@ -486,11 +634,12 @@ evaluation:
   batch_size: auto
   limit: {limit or 'null'}
   output_dir: {os.path.join(output_dir, 'eval_runs')}
-  tokenizer: {model_dir}
+  tokenizer: {os.environ.get('EVAL_TOKENIZER_DIR', model_dir)}
   max_gen_toks: 1024
   num_concurrent: 16
   max_length: {max_length}
   confirm_run_unsafe_code: true
+  apply_chat_template: {os.environ.get('APPLY_CHAT_TEMPLATE', '1')}
 
 recommendation:
   advisor_mode: rules
@@ -581,6 +730,13 @@ def main() -> None:
 
     venv_python, _site = ensure_benchmark_env()
     model_dir, model_name, chat_template = resolve_model_dir()
+
+    # 评测 tokenizer: THINKING=0 (默认) 生成关思考的模板副本
+    thinking = os.environ.get("THINKING", "0") != "0"
+    eval_tok = make_eval_tokenizer(model_dir, thinking)
+    os.environ["EVAL_TOKENIZER_DIR"] = eval_tok
+    _print(f"[run_benchmark_openi] 评测 tokenizer: {eval_tok} "
+           f"(thinking={'on' if thinking else 'off'})")
 
     port = int(os.environ.get("PORT", str(DEFAULT_PORT)))
     ctx = os.environ.get("CONTEXT_LENGTH", "32768")
