@@ -21,6 +21,9 @@ Benchmark 评测 (Auto-benchmark-analyze) — OpenI 平台 Python 入口
     评测用评测 venv python (纯 HTTP 客户端)。
   * SGLang 服务: 参数与本机 V100 实测配置一致 (TP2, torch_native 系,
     disable cuda graph, mem-fraction 0.6, tool-call-parser qwen);
+    启动前预检 triton 与 torch 配套 (triton_key ImportError 是 SGLang 启动
+    超时的经典根因, 镜像里 triton 可能被升到 3.2+, 不匹配自动重装配套版本,
+    TRITON_AUTOFIX=0 关闭; TRITON_VERSION 手动指定);
     轮询 /v1/models 就绪后再评测。SGLANG_START=0 时跳过启动, 复用已有
     服务 (本地调试)。停服务: ss -tlnp 查 PID kill (launch_server 无 .py,
     pkill -f "launch_server[.]py" 匹配不到)。
@@ -51,7 +54,8 @@ Benchmark 评测 (Auto-benchmark-analyze) — OpenI 平台 Python 入口
   BENCHMARK_ROOT / BENCHMARK_VENV / SLIME_PREFIX / SGLANG_PYTHON /
   SGLANG_START / SGLANG_LOG / CUDA_VISIBLE_DEVICES / PYPI_MIRROR /
   GIT_CLONE_URL / OUTPUT_DIR / OUTPUT_SYNC / OUTPUT_SYNC_UPLOAD_OUTPUT /
-  HF_ENDPOINT / HF_ALLOW_CODE_EVAL / INSTALL_DEPS
+  HF_ENDPOINT / HF_ALLOW_CODE_EVAL / INSTALL_DEPS / TRITON_AUTOFIX /
+  TRITON_VERSION
 
 退出码: 与 benchmark-diagnosis 一致; 编排异常统一 FATAL 退出 1。
 """
@@ -87,6 +91,7 @@ CONFIG_KEYS = {
     "SGLANG_START", "SGLANG_LOG", "CUDA_VISIBLE_DEVICES", "PYPI_MIRROR",
     "GIT_CLONE_URL", "OUTPUT_DIR", "OUTPUT_SYNC", "OUTPUT_SYNC_UPLOAD_OUTPUT",
     "HF_ENDPOINT", "HF_ALLOW_CODE_EVAL", "INSTALL_DEPS",
+    "TRITON_AUTOFIX", "TRITON_VERSION",
 }
 
 PYPI_MIRROR = os.environ.get("PYPI_MIRROR", "https://mirrors.aliyun.com/pypi/simple/")
@@ -94,6 +99,44 @@ GIT_CLONE_URL = os.environ.get(
     "GIT_CLONE_URL",
     "https://gh-proxy.com/https://github.com/frelam/Auto-benchmark-analyze.git",
 )
+
+# torch → triton 配套版本 (pip show torch 的 Requires 元数据)。
+# triton >= 3.2 把 triton.compiler.compiler.triton_key 改名 get_cache_key,
+# torch 2.5.x 的 inductor 仍 import triton_key → SGLang 启动时 torch.compile
+# (repetition penalty kernel, sglang/srt/sampling/penaltylib/repetition_penalty.py)
+# 直接抛 ImportError → TP 子进程 SIGQUIT → /v1/models 永不就绪 → 900s 启动超时。
+# 镜像重装/升级依赖可能把 triton 升上去, 启动前预检兜底 (见 ensure_triton_compatible)。
+TRITON_PINS = {
+    "2.5.": "3.1.0",  # torch 2.5.1+cu124 精确要求 triton==3.1.0
+    "2.4.": "3.0.0",
+}
+
+# 探测: 能否 import triton_key (torch 2.5.x inductor 的硬依赖)。
+# 必须设 SETUPTOOLS_USE_DISTUTILS=local (py3.12 + triton 3.1.0 的 setuptools
+# monkey 依赖 distutils)。
+TRITON_PROBE_CODE = r"""
+import sys
+try:
+    import torch
+except Exception as exc:
+    print(f"PROBE_ERROR torch import: {exc}")
+    sys.exit(3)
+try:
+    import triton
+    import triton.compiler.compiler as _tc
+    from triton.compiler.compiler import triton_key  # noqa: F401
+    print(f"PROBE_OK torch={torch.__version__} triton={triton.__version__} "
+          f"triton_key={hasattr(_tc, 'triton_key')}")
+    sys.exit(0)
+except Exception as exc:
+    try:
+        import triton as _t
+        _tv = _t.__version__
+    except Exception:
+        _tv = "?"
+    print(f"PROBE_FAIL torch={torch.__version__} triton={_tv} err={exc}")
+    sys.exit(2)
+"""
 
 
 def _print(msg: str = "") -> None:
@@ -286,8 +329,77 @@ def sglang_python() -> str:
     return sys.executable  # 平台容器无 slime env 时回退当前解释器
 
 
+def _expected_triton(torch_version: str) -> str | None:
+    """torch 版本前缀 → 官方配套 triton 版本 (未知返回 None)。"""
+    for prefix, pin in TRITON_PINS.items():
+        if torch_version.startswith(prefix):
+            return pin
+    return None
+
+
+def ensure_triton_compatible() -> None:
+    """SGLang 启动前预检 triton 与 torch 的兼容性, 不匹配自动重装配套版本。
+
+    根因: torch 2.5.x 的 inductor 依赖 triton.compiler.compiler.triton_key,
+    triton >= 3.2 改名 get_cache_key 后 import 失败 → SGLang 启动时
+    torch.compile (repetition penalty kernel) 直接崩 → TP 子进程 SIGQUIT →
+    /v1/models 永不就绪 → 900s 启动超时。镜像重装/升级依赖会把 triton
+    升上去, 这里启动前兜底: 探针失败 → pip 重装配套版本 → 重探一次。
+    TRITON_AUTOFIX=0 关闭自动修复 (只报错); TRITON_VERSION 手动指定版本。
+    """
+    py = sglang_python()
+    # 无条件强制 local: 平台/后台环境可能注入 SETUPTOOLS_USE_DISTUTILS=stdlib,
+    # py3.12 无 stdlib distutils → triton 3.1.0 import 必挂 (setdefault 不够)
+    os.environ["SETUPTOOLS_USE_DISTUTILS"] = "local"
+    env = os.environ.copy()
+    for _attempt in range(2):
+        _print(f"[run_benchmark_openi] 预检 triton 兼容性 (python={py}) ...")
+        try:
+            r = subprocess.run([py, "-c", TRITON_PROBE_CODE], env=env,
+                               capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            _print("[run_benchmark_openi] ERROR: triton 预检超时")
+            sys.exit(1)
+        stdout = r.stdout or ""
+        if r.returncode == 0 and "PROBE_OK" in stdout:
+            _print(f"[run_benchmark_openi] triton 兼容性 OK "
+                   f"({stdout.strip().splitlines()[-1].strip()})")
+            return
+        detail = (stdout.strip() or (r.stderr or "").strip()).splitlines()
+        last = detail[-1] if detail else f"exit={r.returncode}"
+        _print(f"[run_benchmark_openi] WARNING: triton 与 torch 不兼容: {last}")
+        torch_v = ""
+        for line in detail:
+            for tag in ("PROBE_FAIL torch=", "PROBE_ERROR torch="):
+                if tag in line:
+                    torch_v = line.split(tag, 1)[1].split(" ", 1)[0]
+                    break
+            if torch_v:
+                break
+        expected = os.environ.get("TRITON_VERSION", "").strip() or \
+            _expected_triton(torch_v) or ""
+        if not expected:
+            _print("[run_benchmark_openi] ERROR: 无法确定所需 triton 版本 "
+                   f"(torch={torch_v or '?'}), 请用 TRITON_VERSION 指定或手动安装")
+            sys.exit(1)
+        if os.environ.get("TRITON_AUTOFIX", "1") != "0":
+            _print(f"[run_benchmark_openi] 自动修复: pip install triton=={expected} "
+                   f"(镜像 {PYPI_MIRROR}) ...")
+            subprocess.run([py, "-m", "pip", "install", "-i", PYPI_MIRROR,
+                            f"triton=={expected}"], check=True)
+            continue  # 重探一次
+        _print(f"[run_benchmark_openi] ERROR: triton 不兼容且 TRITON_AUTOFIX=0, "
+               f"请手动执行: {py} -m pip install -i {PYPI_MIRROR} triton=={expected}")
+        sys.exit(1)
+    _print("[run_benchmark_openi] ERROR: triton 自动修复后仍不兼容, 请人工介入 "
+           "(检查 PYTHONPATH 是否污染 triton 包)")
+    sys.exit(1)
+
+
 def launch_sglang(model_dir: str, chat_template: str | None, port: int) -> subprocess.Popen:
     """后台拉起 SGLang (V100 实测参数), 返回 Popen。"""
+    ensure_triton_compatible()  # 失败即退出, 不会白等 900s
+    os.environ["SETUPTOOLS_USE_DISTUTILS"] = "local"  # 无条件覆盖 stdlib
     cmd = [
         sglang_python(), "-m", "sglang.launch_server",
         "--model-path", model_dir,
@@ -336,6 +448,10 @@ def _wait_ready(port: int, timeout: int, log: str) -> None:
             _print(f"[run_benchmark_openi] ... 等待 SGLang ({int(deadline - time.time())}s 剩余)")
         time.sleep(10)
     _print(f"[run_benchmark_openi] ERROR: SGLang 启动超时 ({timeout}s)")
+    _print("[run_benchmark_openi] 提示: 启动前已预检 triton 兼容性; 若日志尾部仍是")
+    _print("[run_benchmark_openi]       triton_key ImportError, 请手动执行:")
+    _print(f"[run_benchmark_openi]       {sglang_python()} -m pip install -i "
+           f"{PYPI_MIRROR} triton==3.1.0")
     try:
         with open(log, encoding="utf-8") as f:
             _print("---- SGLang 日志尾部 ----")
