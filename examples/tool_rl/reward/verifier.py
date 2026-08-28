@@ -58,6 +58,11 @@ _FUNCTION_NAME_RE = re.compile(r"<function=(\w[\w.]*)>")
 _PARAM_RE = re.compile(
     r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", re.DOTALL,
 )
+# Inline JSON style: <tool_call>\n"name": NAME, "arguments": {...}\n</tool_call>
+_INLINE_CALL_RE = re.compile(
+    r'^\s*"name"\s*:\s*"([\w.]*)",\s*"arguments"\s*:\s*(\{.*\})\s*$',
+    re.DOTALL,
+)
 
 # Fallback: JSON format tool calls — bracket-matching is more robust than
 # regex because it handles nested objects/arrays inside arguments.
@@ -105,9 +110,10 @@ def parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
     for tc_match in _TOOL_CALL_BLOCK_RE.finditer(text):
         block = tc_match.group(1)
         func_match = _FUNCTION_NAME_RE.search(block)
-        if not func_match:
+        inline_match = _INLINE_CALL_RE.search(block)
+        if not func_match and not inline_match:
             continue
-        func_name = func_match.group(1)
+        func_name = func_match.group(1) if func_match else inline_match.group(1)
 
         args: dict[str, Any] = {}
         for pm in _PARAM_RE.finditer(block):
@@ -118,6 +124,12 @@ def parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
             except (json.JSONDecodeError, TypeError):
                 pass
             args[pname] = pval
+
+        if inline_match and not args:
+            try:
+                args = json.loads(inline_match.group(2))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
 
         calls.append({"name": func_name, "arguments": args})
 
@@ -231,7 +243,7 @@ def _xml_tool_call_spans(text: str) -> list[tuple[int, int]]:
     """
     spans: list[tuple[int, int]] = []
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
-        if _FUNCTION_NAME_RE.search(m.group(1)):
+        if _FUNCTION_NAME_RE.search(m.group(1)) or _INLINE_CALL_RE.search(m.group(1)):
             spans.append((m.start(), m.end()))
     return spans
 

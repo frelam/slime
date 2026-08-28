@@ -65,6 +65,15 @@ def _xml_call(name: str = "get_weather", value: str = '"Beijing"') -> str:
     )
 
 
+def _inline_call(name: str = "get_weather", args: str = '{"city": "Beijing"}') -> str:
+    """Inline JSON style: <tool_call>"name":..., "arguments": {...}</tool_call>"""
+    return (
+        "<tool_call>\n"
+        f'"name": "{name}", "arguments": {args}\n'
+        "</tool_call>"
+    )
+
+
 # ============================================================================
 # <think> validity — exactly one, non-empty content
 # ============================================================================
@@ -271,6 +280,34 @@ class TestJsonFallback:
     def test_json_call_after_think_full(self):
         text = '<think>x</think>\n{"name": "get_weather", "arguments": {"city": "Beijing"}}'
         assert _format_score(text) == pytest.approx(1.0)
+
+
+# ============================================================================
+# Inline JSON tool_call format — <tool_call>"name":..., "arguments": {...}</tool_call>
+# ============================================================================
+
+class TestInlineJsonFormat:
+    """The inline JSON style is recognized by both Dim 2 and Dim 3."""
+
+    def test_inline_call_after_think_full(self):
+        text = "<think>x</think>\n" + _inline_call()
+        assert _format_score(text) == pytest.approx(1.0)
+        assert _tool_call_format_score(text) == pytest.approx(1.0)
+
+    def test_inline_call_parsed_args(self):
+        from examples.tool_rl.reward.verifier import parse_qwen_tool_calls
+
+        calls = parse_qwen_tool_calls(_inline_call())
+        assert calls == [{"name": "get_weather", "arguments": {"city": "Beijing"}}]
+
+    def test_inline_unknown_tool_penalized_dim3(self):
+        text = "<think>x</think>\n" + _inline_call(name="not_a_tool")
+        assert _tool_call_format_score(text) == pytest.approx(0.0)
+
+    def test_inline_call_counted_in_spans(self):
+        from examples.tool_rl.reward.verifier import _xml_tool_call_spans
+
+        assert len(_xml_tool_call_spans(_inline_call())) == 1
 
 
 # ============================================================================
