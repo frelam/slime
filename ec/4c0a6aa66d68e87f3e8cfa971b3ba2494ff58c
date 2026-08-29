@@ -1,0 +1,39 @@
+examples/tool_rl/reward/reward.py
+  s_9545b0f7f3fc29::t_0b0e630af31f5e 255-257
+examples/tool_rl/reward/verifier.py
+  s_9545b0f7f3fc29::t_989635f3286346 719,721-728
+  s_9545b0f7f3fc29::t_f5546002b06ef1 755-764
+  s_9545b0f7f3fc29::t_d113c583ae62a6 686-693
+  s_9545b0f7f3fc29::t_665dd707733049 658-668
+tests/test_tool_rl_reward.py
+  s_9545b0f7f3fc29::t_042f4b6e3b1806 609-695
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "ec4c0a6aa66d68e87f3e8cfa971b3ba2494ff58c",
+  "prompts": {},
+  "sessions": {
+    "s_9545b0f7f3fc29": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9249863286b8e10f3d4ba6",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "external_session_id": "6a9249863286b8e10f3d4ba6",
+        "operation_id": "6a924bad3286b8e10f3d4c01",
+        "edit_kind": "file_edit",
+        "session_id": "6a9249863286b8e10f3d4ba6",
+        "tool_type": "builtin",
+        "runtime_client": "trae-tob-git-ai",
+        "dedupe_key": "6a9249863286b8e10f3d4ba6:6a924bad3286b8e10f3d4c01:afterEdit:a320b87b",
+        "tool_use_id": "6a924bad3286b8e10f3d4c01",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "source_scene": "agent",
+        "client_type": "ide"
+      }
+    }
+  }
+}
