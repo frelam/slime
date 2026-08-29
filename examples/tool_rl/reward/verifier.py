@@ -655,6 +655,17 @@ def _format_call(call: dict[str, Any]) -> str:
     return name + "()"
 
 
+def _guess_penalty(n_emitted: int) -> float:
+    """Penalty for blind tool guessing: ``-0.1`` per emitted call, capped at ``-1.0``.
+
+    Applied when the model emits tool calls that hit **none** of the ground
+    truth labels (or when the label says no tools are needed but the model
+    still called tools). Returns the magnitude (a non-negative float); callers
+    negate it.
+    """
+    return min(0.1 * n_emitted, 1.0)
+
+
 def match_tool_calls_against_label(
     output_calls: list[dict[str, Any]],
     label_calls: list[dict[str, Any]],
@@ -671,6 +682,14 @@ def match_tool_calls_against_label(
         M = len(output_calls)
         N = len(label_calls)
         matched = number of label calls that found a partner by tool name.
+
+    If **no** label call is matched (``matched == 0``) — the model guessed
+    tool(s) that hit none of the ground truth labels — each emitted call is
+    penalized to discourage blind guessing: ``name_score`` and
+    ``param_score`` are both set to ``-min(0.1 * M, 1.0)``. This covers both
+    "label requires tools but nothing matched" and "label requires no tools
+    but the model still called tools". When both are empty, the score stays
+    ``(1.0, 1.0)`` (correct "no tools" response).
 
     Args:
         output_calls: Parsed tool calls from the model output
@@ -697,13 +716,16 @@ def match_tool_calls_against_label(
         logger.info("[tool_rl] Label calls: (none / no tools needed)")
 
     if not label_calls:
-        # Label says "no tools needed"
-        result = (1.0, 1.0) if not output_calls else (0.0, 0.0)
-        if output_calls:
-            logger.info("[tool_rl] Mismatch: label expects no tools, but model called %d tool(s)", len(output_calls))
-        else:
+        if not output_calls:
             logger.info("[tool_rl] Match: both empty → 1.0")
-        return result
+            return (1.0, 1.0)
+        # Label says "no tools needed" but the model still guessed tools
+        penalty = _guess_penalty(len(output_calls))
+        logger.info(
+            "[tool_rl] Mismatch: label expects no tools, but model called %d tool(s) → penalty %.2f",
+            len(output_calls), -penalty,
+        )
+        return (-penalty, -penalty)
 
     matched_indices: set[int] = set()
     pair_param_scores: list[float] = []
@@ -730,6 +752,16 @@ def match_tool_calls_against_label(
             pair_param_scores.append(best_param_score)
 
     matched = len(pair_param_scores)
+
+    # No label call hit — the model guessed tool(s) that missed entirely.
+    if matched == 0:
+        penalty = _guess_penalty(len(output_calls))
+        logger.info(
+            "[tool_rl] No label call matched (%d output vs %d label) → penalty %.2f",
+            len(output_calls), len(label_calls), -penalty,
+        )
+        return (-penalty, -penalty)
+
     m = len(output_calls)
     n = len(label_calls)
     union = m + n - matched  # Jaccard denominator

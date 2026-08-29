@@ -252,7 +252,9 @@ async def compute_tool_rl_reward(
 
     # ── Weighted sum ────────────────────────────────────
     total = weights["tool_correctness"] * tool_correctness + weights["format"] * format_score + weights["tool_call"] * tool_call_score
-    total = max(0.0, min(1.0, total))
+    # Allow negative totals so blind tool guessing (penalized in
+    # tool_correctness) is reflected as a negative score.
+    total = min(1.0, total)
 
     breakdown = ToolRLRewardBreakdown(
         total=total,

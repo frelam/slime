@@ -606,3 +606,90 @@ class TestComputeToolRlReward:
         assert breakdown.tool_correctness == pytest.approx(1.0)
         assert breakdown.tool_call_format == pytest.approx(1.0)
         assert breakdown.total == pytest.approx(1.0)
+
+
+# ============================================================================
+# Blind tool-guessing penalty — no label call matched
+# ============================================================================
+
+
+class TestGuessPenalty:
+    """Each guessed tool call scores -0.1 (capped at -1) when nothing hits."""
+
+    def test_guess_penalty_unit(self):
+        from examples.tool_rl.reward.verifier import _guess_penalty
+
+        assert _guess_penalty(0) == pytest.approx(0.0)
+        assert _guess_penalty(1) == pytest.approx(0.1)
+        assert _guess_penalty(3) == pytest.approx(0.3)
+        assert _guess_penalty(10) == pytest.approx(1.0)  # cap at -1
+        assert _guess_penalty(15) == pytest.approx(1.0)  # stays capped
+
+    def test_no_tool_label_with_guessed_calls_is_penalized(self):
+        from examples.tool_rl.reward.verifier import match_tool_calls_against_label
+
+        guessed = [
+            {"name": "g1", "arguments": {}},
+            {"name": "g2", "arguments": {}},
+            {"name": "g3", "arguments": {}},
+        ]
+        name_score, param_score = match_tool_calls_against_label(guessed, [])
+        # 3 guesses @ -0.1 each
+        assert name_score == pytest.approx(-0.3)
+        assert param_score == pytest.approx(-0.3)
+
+    def test_no_label_no_calls_not_penalized(self):
+        from examples.tool_rl.reward.verifier import match_tool_calls_against_label
+
+        assert match_tool_calls_against_label([], []) == (pytest.approx(1.0), pytest.approx(1.0))
+
+    def test_wrong_tools_when_label_has_tools_is_penalized(self):
+        from examples.tool_rl.reward.verifier import match_tool_calls_against_label
+
+        wrong = [
+            {"name": "wrong_a", "arguments": {}},
+            {"name": "wrong_b", "arguments": {}},
+        ]
+        label = [{"name": "correct_tool", "arguments": {"city": "x"}}]
+        name_score, param_score = match_tool_calls_against_label(wrong, label)
+        assert name_score == pytest.approx(-0.2)
+        assert param_score == pytest.approx(-0.2)
+
+    def test_partial_match_not_penalized(self):
+        """Near-hits using the Jaccard formula keep normal scoring (> 0)."""
+        from examples.tool_rl.reward.verifier import match_tool_calls_against_label
+
+        output = [{"name": "t", "arguments": {"a": 1}}]
+        label = [{"name": "t", "arguments": {"a": 1}}, {"name": "u", "arguments": {}}]
+        name_score, param_score = match_tool_calls_against_label(output, label)
+        # matched=1, M=1, N=2 → name = 1/2
+        assert name_score == pytest.approx(0.5)
+        assert param_score == pytest.approx(0.5)
+
+    def test_end_to_end_total_goes_negative_when_guessing(self):
+        import asyncio
+
+        from examples.tool_rl.reward.reward import compute_tool_rl_reward
+
+        class Args:
+            reward_weights = None
+
+        tools = [{"name": "get_weather", "parameters": {"type": "object"}}]
+        text = (
+            " thinkingok response\n"
+            "<tool_call><function=wrong_a></function></tool_call>\n"
+            "<tool_call><function=wrong_b></function></tool_call>"
+        )
+        traj = [_make_trajectory_record(text=text)]
+        breakdown = asyncio.run(
+            compute_tool_rl_reward(
+                Args(),
+                traj,
+                "task",
+                available_tools=tools,
+                ground_truth_calls=[],
+            )
+        )
+
+        assert breakdown.tool_correctness == pytest.approx(-0.2)
+        assert breakdown.total < 0.0
