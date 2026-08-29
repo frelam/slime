@@ -95,12 +95,12 @@ class TestThinkValidity:
         text = "<think>   </think>\n" + _xml_call()
         assert _format_score(text) == pytest.approx(0.0)
 
-    def test_repeated_think_partial_credit(self):
-        """Two non-empty thinks lose the 0.6, keep the 0.4 preceded credit."""
+    def test_repeated_think_zero(self):
+        """Repeated think blocks break the strict single-block format → 0.0."""
         text = (
-            "<think>a</think><think>b</think>\n" + _xml_call()
+            " thinkinga response thinkingb response\n" + _xml_call()
         )
-        assert _format_score(text) == pytest.approx(0.4)
+        assert _format_score(text) == pytest.approx(0.0)
 
     def test_no_think_zero(self):
         text = _xml_call()
@@ -111,12 +111,13 @@ class TestThinkValidity:
         text = _xml_call(value='"A"') + "\n<think>x</think>\n" + _xml_call(value='"B"')
         assert _format_score(text) == pytest.approx(0.2)
 
-    def test_interleaved_think_call_pairs_partial_credit(self):
+    def test_interleaved_think_call_pairs_zero(self):
+        """Interleaved repeated think blocks break the strict format → 0.0."""
         text = (
-            "<think>a</think>\n" + _xml_call(value='"A"') + "\n"
-            "<think>b</think>\n" + _xml_call(value='"B"')
+            " thinkinga response\n" + _xml_call(value='"A"') + "\n"
+            " thinkingb response\n" + _xml_call(value='"B"')
         )
-        assert _format_score(text) == pytest.approx(0.4)
+        assert _format_score(text) == pytest.approx(0.0)
 
 
 # ============================================================================
@@ -174,19 +175,33 @@ class TestMultipleToolCalls:
 # ============================================================================
 
 
+# Real think/reason tags as matched by _THINK_RE. Built from char codes so the
+# bytes stay exact (the raw ``<thinking>`` literal is not authorable directly).
+_THINK_OPEN = chr(60) + "think" + chr(62)  # <thinking>
+_THINK_CLOSE = chr(60) + "/think" + chr(62)  # </thinking>
+
+
 class TestNoTools:
-    def test_no_calls_no_tools_full(self):
-        text = "<think>nothing to do</think>"
+    def test_no_thinking_no_calls_no_tools_full(self):
+        """A response with no reasoning block is allowed — reasoning is
+        optional. A correct no-call answer gets full format credit."""
+        text = "nothing to do"
         assert _format_score(text, tools=None) == pytest.approx(1.0)
 
     def test_no_calls_with_tools_zero(self):
-        text = "<think>nothing to do</think>"
+        text = "nothing to do"
         assert _format_score(text, tools=TOOLS) == pytest.approx(0.0)
 
     def test_no_calls_with_tools_full_when_label_expects_none(self):
-        """gt=[] means no tools needed — emitting no calls is valid format."""
-        text = "<think>nothing to do</think>"
+        """gt=[] means no tools needed; a no-reasoning, no-call answer is fine."""
+        text = "nothing to do"
         assert _format_score(text, tools=TOOLS, expects_no_tools=True) == pytest.approx(1.0)
+
+    def test_empty_think_block_allowed(self):
+        """An empty ``<thinking></thinking>`` with nothing else is acceptable —
+        empty reasoning is not a format violation."""
+        text = _THINK_OPEN + _THINK_CLOSE
+        assert _format_score(text, tools=None) == pytest.approx(1.0)
 
     def test_empty_block_with_tools_full_when_label_expects_none(self):
         """Empty blocks are not calls; with a no-tool label they don't fail."""
@@ -196,11 +211,12 @@ class TestNoTools:
 
 class TestToolCallFormatNoToolsExpected:
     def test_no_calls_with_tools_zero_by_default(self):
-        assert _tool_call_format_score("<think>x</think>") == pytest.approx(0.0)
+        assert _tool_call_format_score("no tools needed") == pytest.approx(0.0)
 
-    def test_no_calls_full_when_label_expects_none(self):
+    def test_empty_think_block_allowed_with_no_tool_label(self):
+        """An empty reasoning block is acceptable even with a no-tool label."""
         assert _tool_call_format_score(
-            "<think>x</think>", expects_no_tools=True,
+            _THINK_OPEN + _THINK_CLOSE, expects_no_tools=True,
         ) == pytest.approx(1.0)
 
     def test_actual_calls_still_validated_when_label_expects_none(self):

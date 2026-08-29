@@ -50,6 +50,22 @@ logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
+def _check_strict_format(text: str) -> bool:
+    """Validate the top-level layout of a response's think/reason block.
+
+    Allowed layouts:
+      1. No thinking at all — a bare response text and/or ``<tool_call>``.
+      2. Exactly one think block (``<thinking>...</thinking>``), whether its
+         reasoning content is empty or not, and whether anything follows it
+         or not. ``think  response`` (empty reasoning) is acceptable.
+
+    Rejected — a format violation only when there is MORE than one think
+    block, since that layout is ambiguous.
+    """
+    matches = list(_THINK_RE.finditer(text))
+    return len(matches) <= 1
+
+
 # Qwen XML tool call: <tool_call>...<function=NAME>...</function>...</tool_call>
 _TOOL_CALL_BLOCK_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE,
@@ -176,6 +192,15 @@ def check_format_compliance(
         Score in [0.0, 1.0].
     """
     all_text = _get_agent_text(trajectory)
+
+    # Strict gate: the response must be a well-formed thinking→response block
+    # with something (response text / tool_call) after it. Emitting only a
+    # think block and stopping is a format violation — even when it makes no
+    # tool calls.
+    if not _check_strict_format(all_text):
+        logger.debug("[dim2] Strict thinking→response format broken → 0.0")
+        return 0.0
+
     n_calls = len(_xml_tool_call_spans(all_text))
     n_calls += len(_find_json_tool_call_spans(all_text))
 
@@ -317,6 +342,13 @@ def check_tool_call_format(
         Score in [0.0, 1.0].
     """
     all_text = _get_agent_text(trajectory)
+
+    # Same strict gate: the no-call 1.0 branch must not reward a
+    # think-then-stop collapse either.
+    if not _check_strict_format(all_text):
+        logger.debug("[dim3] Strict thinking→response format broken → 0.0")
+        return 0.0
+
     parsed = parse_qwen_tool_calls(all_text)
 
     if not parsed:
