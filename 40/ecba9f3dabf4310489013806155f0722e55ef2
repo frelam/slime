@@ -1,0 +1,46 @@
+tests/test_tool_rl_reward.py
+  s_c4115571c60e6a::t_960c6ec576a16f 446-470
+  s_c4115571c60e6a::t_0b0b69389db237 471
+examples/tool_rl/reward/verifier.py
+  s_c4115571c60e6a::t_4bc6bf97a5c612 53,55,61,64-65,67-68
+  s_c4115571c60e6a::t_8855dbc2c70dc2 345-351
+  s_c4115571c60e6a::t_58639e65028ea6 54,56-60,62-63,66
+  s_c4115571c60e6a::t_98710f00cc7f10 195-203
+tests/test_tool_rl_verifier_format.py
+  s_c4115571c60e6a::t_a2810d86921ad1 114-115,117-118,120
+  s_c4115571c60e6a::t_aaf5f9986d6630 200-204
+  s_c4115571c60e6a::t_0d8f5e2ad0c502 205
+  s_c4115571c60e6a::t_b3d0e0da867a2a 98-99,101,103
+  s_c4115571c60e6a::t_56d91eb224fc62 214
+  s_c4115571c60e6a::t_87c5e18b22b240 216-217,219
+  s_c4115571c60e6a::t_f67ab2ddee0431 178-183,185-188,192,196-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "40ecba9f3dabf4310489013806155f0722e55ef2",
+  "prompts": {},
+  "sessions": {
+    "s_c4115571c60e6a": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9296543286b8e10f3d4c6c",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "tool_type": "builtin",
+        "edit_kind": "file_edit",
+        "session_id": "6a9296543286b8e10f3d4c6c",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "external_session_id": "6a9296543286b8e10f3d4c6c",
+        "operation_id": "6a92a9b13286b8e10f3d4de7",
+        "client_type": "ide",
+        "tool_use_id": "6a92a9b13286b8e10f3d4de7",
+        "source_scene": "agent",
+        "dedupe_key": "6a9296543286b8e10f3d4c6c:6a92a9b13286b8e10f3d4de7:afterEdit:a320b87b"
+      }
+    }
+  }
+}
