@@ -23,11 +23,16 @@ Dim 1 has two modes:
   - Tool name correctness (0.0-1.0)
   - Parameter content correctness (0.0-1.0)
 
+In both modes, calling a tool that is **not declared in the system prompt**
+incurs a ``-0.1`` per-call penalty on Dim 1, floored at ``0.0`` (it can never
+push Dim 1 below zero).
+
 Dim 2 — Verifier (format):
   0.6 if all tool_calls after reasoning + 0.4 × count/N for think before each call
 
-Dim 3 — Verifier (tool call format):
-  1/N × 0.5 name + 1/N × 0.3 param_name + 1/N × 0.2 param_type per call
+Dim 3 — Verifier (tool call format vs label):
+  1/N per label call completely matched (name + param names + param types);
+  full score when the label has no tool calls
 """
 
 from __future__ import annotations
@@ -174,6 +179,7 @@ async def compute_tool_rl_reward(
         match_tool_calls_against_label,
         parse_ground_truth_calls,
         parse_qwen_tool_calls,
+        undeclared_tool_penalty,
     )
 
     weights = get_weights(args)
@@ -193,6 +199,7 @@ async def compute_tool_rl_reward(
     verifier = compute_verifier_scores(
         trajectory,
         available_tools=available_tools,
+        label_calls=parsed_gt,
         expects_no_tools=has_gt and not parsed_gt,
     )
     format_score = verifier["format_compliance"]
@@ -249,6 +256,18 @@ async def compute_tool_rl_reward(
                 "name_reason": rm.get("name_reason", ""),
                 "param_reason": rm.get("param_reason", ""),
             }
+
+    # ── Dim 1: undeclared-tool penalty ─────────────────────────
+    # Calling a tool that is not declared in the system prompt is penalized
+    # by -0.1 per call. It can reduce Dim 1 down to 0 but never below it.
+    undeclared_penalty = undeclared_tool_penalty(output_calls, available_tools)
+    if undeclared_penalty > 0:
+        tool_correctness = max(0.0, tool_correctness - undeclared_penalty)
+        details["undeclared_tool_penalty"] = undeclared_penalty
+        logger.info(
+            "[tool_rl] Dim 1 undeclared-tool penalty -%.2f → correctness %.3f",
+            undeclared_penalty, tool_correctness,
+        )
 
     # ── Weighted sum ────────────────────────────────────
     total = weights["tool_correctness"] * tool_correctness + weights["format"] * format_score + weights["tool_call"] * tool_call_score

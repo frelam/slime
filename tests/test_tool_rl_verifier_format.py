@@ -43,16 +43,11 @@ def _format_score(
 
 def _tool_call_format_score(
     text: str,
-    tools: list[dict] | None = TOOLS,
-    expects_no_tools: bool = False,
+    label_calls: list[dict] | None = None,
 ) -> float:
     from examples.tool_rl.reward.verifier import check_tool_call_format
 
-    return check_tool_call_format(
-        _traj(text),
-        tools,
-        expects_no_tools=expects_no_tools,
-    )
+    return check_tool_call_format(_traj(text), label_calls=label_calls)
 
 
 def _xml_call(name: str = "get_weather", value: str = '"Beijing"') -> str:
@@ -224,67 +219,83 @@ class TestNoTools:
         assert _format_score(text, tools=TOOLS, expects_no_tools=True) == pytest.approx(1.0)
 
 
-class TestToolCallFormatNoToolsExpected:
-    def test_no_calls_with_tools_zero_by_default(self):
-        assert _tool_call_format_score("no tools needed") == pytest.approx(0.0)
-
-    def test_empty_think_block_allowed_with_no_tool_label(self):
-        """An empty reasoning block followed by an answer is acceptable even
-        with a no-tool label; a think-only output is not."""
-        assert _tool_call_format_score(
-            _THINK_OPEN + _THINK_CLOSE + "\nno tools needed", expects_no_tools=True,
-        ) == pytest.approx(1.0)
-        assert _tool_call_format_score(
-            _THINK_OPEN + _THINK_CLOSE, expects_no_tools=True,
-        ) == pytest.approx(0.0)
-
-    def test_actual_calls_still_validated_when_label_expects_none(self):
-        """A no-tool label doesn't disable Dim 3 if the model calls anyway."""
-        text = "<think>x</think>\n" + _xml_call()
-        assert _tool_call_format_score(text, expects_no_tools=True) == pytest.approx(1.0)
-
-        unknown = "<think>x</think>\n" + _xml_call(name="not_a_tool")
-        assert _tool_call_format_score(unknown, expects_no_tools=True) == pytest.approx(0.0)
+LABEL_WEATHER = [{"name": "get_weather", "arguments": {"city": "Beijing"}}]
+LABEL_TWO = [
+    {"name": "get_weather", "arguments": {"city": "Beijing"}},
+    {"name": "get_time", "arguments": {"tz": "UTC"}},
+]
 
 
-class TestToolCallFormatParamNames:
-    """Dim 3 must not penalize omitting optional schema parameters."""
+class TestToolCallFormatNoLabel:
+    """Dim 3 = full score when the label has no tool calls (no detection)."""
 
-    @staticmethod
-    def _two_param_tools() -> list[dict]:
-        return [
-            {
-                "name": "get_weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "city": {"type": "string"},
-                        "unit": {"type": "string"},
-                    },
-                },
-            },
-        ]
+    def test_no_label_full_score(self):
+        assert _tool_call_format_score("no tools needed") == pytest.approx(1.0)
 
-    def test_matching_subset_of_optional_params_full(self):
-        """A call that matches the label (only `city`) should get Dim 3 = 1.0."""
-        text = "<think>x</think>\n" + _xml_call()
-        assert _tool_call_format_score(
-            text, tools=self._two_param_tools(),
-        ) == pytest.approx(1.0)
+    def test_no_label_full_score_even_with_calls(self):
+        text = " thinkingx response\n" + _xml_call()
+        assert _tool_call_format_score(text) == pytest.approx(1.0)
 
-    def test_undeclared_param_still_penalized(self):
+    def test_no_label_full_score_even_with_garbage(self):
+        """Without a label there is no detection — think-then-stop collapse,
+        wrong tool names, etc. are all ignored (score stays 1.0)."""
+        assert _tool_call_format_score(" thinkingdeep reasoning response") == pytest.approx(1.0)
+        assert _tool_call_format_score(_THINK_OPEN) == pytest.approx(1.0)
+        assert _tool_call_format_score(_xml_call(name="not_a_tool")) == pytest.approx(1.0)
+
+
+class TestToolCallFormatLabelMatch:
+    """Dim 3 matches output calls against ground-truth label calls.
+
+    A call is a complete match when the tool name agrees, the output provides
+    exactly the label's parameter names, and every parameter value has a
+    compatible type. Values themselves are ignored. Score = matched / N.
+    """
+
+    def test_exact_name_match_full(self):
+        text = " thinkingx response\n" + _xml_call()  # get_weather(city="Beijing")
+        assert _tool_call_format_score(text, label_calls=LABEL_WEATHER) == pytest.approx(1.0)
+
+    def test_wrong_tool_name_zero(self):
+        text = " thinkingx response\n" + _xml_call(name="get_other")
+        assert _tool_call_format_score(text, label_calls=LABEL_WEATHER) == pytest.approx(0.0)
+
+    def test_wrong_param_name_zero(self):
         text = (
-            "<think>x</think>\n"
+            " thinkingx response\n"
             "<tool_call>\n"
             "<function=get_weather>\n"
-            '<parameter=city>"Beijing"</parameter>\n'
-            '<parameter=bogus>"x"</parameter>\n'
+            '<parameter=city2>"Beijing"</parameter>\n'
             "</function>\n"
             "</tool_call>"
         )
-        assert _tool_call_format_score(
-            text, tools=self._two_param_tools(),
-        ) == pytest.approx(0.75)
+        assert _tool_call_format_score(text, label_calls=LABEL_WEATHER) == pytest.approx(0.0)
+
+    def test_param_type_mismatch_zero(self):
+        """Label expects city as a string; output passes an int → mismatch."""
+        text = " thinkingx response\n" + _xml_call(value="123")
+        assert _tool_call_format_score(text, label_calls=LABEL_WEATHER) == pytest.approx(0.0)
+
+    def test_value_content_ignored(self):
+        """Different values are fine — only param names and types are checked."""
+        text = " thinkingx response\n" + _xml_call(value='"Tokyo"')
+        assert _tool_call_format_score(text, label_calls=LABEL_WEATHER) == pytest.approx(1.0)
+
+    def test_partial_match_ratio(self):
+        """Only get_weather matched → 1/2 of the two label calls."""
+        text = " thinkingx response\n" + _xml_call()
+        assert _tool_call_format_score(text, label_calls=LABEL_TWO) == pytest.approx(0.5)
+
+    def test_extra_output_call_does_not_add(self):
+        """Extra unmatched output calls don't increase the score."""
+        text = " thinkingx response\n" + _xml_call() + "\n" + _xml_call(name="other", value='"A"')
+        assert _tool_call_format_score(text, label_calls=LABEL_WEATHER) == pytest.approx(1.0)
+
+    def test_missing_param_not_complete_match(self):
+        """Label expects two params; output provides only one → not complete."""
+        label_two_params = [{"name": "get_weather", "arguments": {"city": "Beijing", "unit": "C"}}]
+        text = " thinkingx response\n" + _xml_call()  # only city
+        assert _tool_call_format_score(text, label_calls=label_two_params) == pytest.approx(0.0)
 
 
 class TestValuesMatch:
@@ -327,7 +338,9 @@ class TestInlineJsonFormat:
     def test_inline_call_after_think_full(self):
         text = "<think>x</think>\n" + _inline_call()
         assert _format_score(text) == pytest.approx(1.0)
-        assert _tool_call_format_score(text) == pytest.approx(1.0)
+        assert _tool_call_format_score(
+            text, label_calls=LABEL_WEATHER,
+        ) == pytest.approx(1.0)
 
     def test_inline_call_parsed_args(self):
         from examples.tool_rl.reward.verifier import parse_qwen_tool_calls
@@ -335,9 +348,11 @@ class TestInlineJsonFormat:
         calls = parse_qwen_tool_calls(_inline_call())
         assert calls == [{"name": "get_weather", "arguments": {"city": "Beijing"}}]
 
-    def test_inline_unknown_tool_penalized_dim3(self):
-        text = "<think>x</think>\n" + _inline_call(name="not_a_tool")
-        assert _tool_call_format_score(text) == pytest.approx(0.0)
+    def test_inline_unknown_tool_does_not_match_label_dim3(self):
+        text = " thinkingx response\n" + _inline_call(name="not_a_tool")
+        assert _tool_call_format_score(
+            text, label_calls=LABEL_WEATHER,
+        ) == pytest.approx(0.0)
 
     def test_inline_call_counted_in_spans(self):
         from examples.tool_rl.reward.verifier import _xml_tool_call_spans

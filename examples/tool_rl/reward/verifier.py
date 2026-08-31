@@ -26,13 +26,11 @@ Dimensions
   Empty <tool_call> blocks (no <function=...> header) are not counted as
   tool calls.
 
-- **Dim 3 (weight 0.20)**: Tool call format correctness — rule verifier
-  Scoring (N = total tool calls):
-    1. Tool name correct + no undeclared tools → +1/N × 0.5
-    2. Param name correct + no undeclared params → +1/N × 0.3
-    3. Param type correct → +1/N × 0.2
-    4. No calls → 1.0 when no tools are expected (label says no tools
-       needed, or no tools are defined), otherwise 0.0
+- **Dim 3 (weight 0.20)**: Tool call format correctness vs ground-truth label
+  Scoring (N = number of label tool calls):
+    1. Each label call completely matched by an output call (same tool name,
+       exactly the label's param names, compatible param types) → +1/N
+    2. Label has no tool calls → 1.0 (no detection, even in RM mode)
 """
 
 from __future__ import annotations
@@ -342,99 +340,112 @@ def _count_preceded_by_think(text: str, total: int) -> int:
 
 def check_tool_call_format(
     trajectory: list[dict[str, Any]],
-    available_tools: list[dict[str, Any]] | None = None,
-    expects_no_tools: bool = False,
+    label_calls: list[dict[str, Any]] | None = None,
 ) -> float:
-    """Check tool call name, param name, param type correctness.
+    """Check model tool calls against ground-truth label calls (Dim 3).
 
-    Scoring (N = total tool calls):
-      1. Name correct + not undeclared → +1/N × 0.5
-      2. Param name correct + not undeclared → +1/N × 0.3
-      3. Param type correct → +1/N × 0.2
-      4. No calls → 1.0 when no tools are expected (label says no tools
-         needed, or no tools are defined), otherwise 0.0 if tools are defined
+    Only param **names** and param **types** are checked — values are ignored
+    and there is no ``available_tools`` "undeclared tool" penalty.
+
+    Two cases:
+      1. The label provides tool calls (``label_calls`` non-empty): scoring is
+         ``matched / len(label_calls)``. A call is **completely matched** when
+         an output call shares the same tool name, provides exactly the label's
+         parameter names, and every parameter value has a compatible type.
+         N = total label tool calls, so the maximum is 1.0.
+      2. The label provides no tool calls (or no label is available, e.g. RM
+         mode): score is ``1.0`` — no detection is performed.
+
+    The strict format gate (``_check_strict_format``) still applies in case 1
+    so a think-then-stop collapse is not rewarded.
 
     Args:
         trajectory: Normalized trajectory.
-        available_tools: Tool definitions. If non-empty and no calls, score 0.
-        expects_no_tools: Label says no tools are needed for this task.
+        label_calls: Ground truth tool calls from the dataset
+            (``[{"name": …, "arguments": {…}}]``). If empty, full score.
 
     Returns:
         Score in [0.0, 1.0].
     """
     all_text = _get_agent_text(trajectory)
 
-    # Same strict gate: the no-call 1.0 branch must not reward a
-    # think-then-stop collapse either.
+    # Case 2: label has no tool calls → full score, no detection.
+    if not label_calls:
+        logger.debug("[dim3] No label tool calls → 1.0 (no detection)")
+        return 1.0
+
+    # Case 1: strict format gate still applies.
     if not _check_strict_format(all_text):
         logger.debug("[dim3] Strict thinking→response format broken → 0.0")
         return 0.0
 
-    parsed = parse_qwen_tool_calls(all_text)
+    output_calls = parse_qwen_tool_calls(all_text)
+    n = len(label_calls)
+    matched = _count_label_matches(output_calls, label_calls)
+    score = matched / n
 
-    if not parsed:
-        if expects_no_tools or not available_tools:
-            reason = "label says no tools needed" if expects_no_tools else "no tools defined"
-            logger.debug("[dim3] No tool calls and %s → 1.0", reason)
-            return 1.0
-        logger.debug("[dim3] No tool calls but tools available → 0.0")
-        return 0.0
+    logger.debug("[dim3] label=%d matched=%d → %.3f", n, matched, score)
+    return score
 
-    n = len(parsed)
-    available = available_tools or []
 
-    tool_names, tool_params = _build_tool_index(available)
+def _values_types_match(v1: Any, v2: Any) -> bool:
+    """Check that two values have a compatible primitive type.
 
-    name_acc = 0.0
-    pname_acc = 0.0
-    ptype_acc = 0.0
+    Numbers (int/float) are mutually compatible; ``bool`` is distinct from
+    ``int``; ``None`` only matches ``None``; containers (list/dict) must be
+    the same kind.  JSON-encoded array/object strings are unwrapped first, so
+    a label storing ``'["a","b"]'`` is type-compatible with a parsed list.
+    """
+    v1 = _unwrap_json_string(v1)
+    v2 = _unwrap_json_string(v2)
+    if v1 is None or v2 is None:
+        return v1 is None and v2 is None
+    if isinstance(v1, bool) != isinstance(v2, bool):
+        return False
+    if isinstance(v1, bool):
+        return v1 == v2
+    if isinstance(v1, (int, float)):
+        return isinstance(v2, (int, float))
+    if isinstance(v1, list):
+        return isinstance(v2, list)
+    if isinstance(v1, dict):
+        return isinstance(v2, dict)
+    return isinstance(v1, str) and isinstance(v2, str)
 
-    for call in parsed:
-        cname = call.get("name", "")
-        cargs = call.get("arguments", {}) or {}
 
-        # 1. Name correctness
-        if cname and cname in tool_names:
-            name_acc += 1.0
-        elif cname:
-            logger.debug("[dim3] Unknown tool: %r", cname)
+def _call_completely_matches(
+    output_call: dict[str, Any],
+    label_call: dict[str, Any],
+) -> bool:
+    """A call completely matches a label call when the tool name agrees, the
+    output provides exactly the label's parameter names, and every parameter
+    value has a compatible type. Values themselves are ignored.
+    """
+    if output_call.get("name", "") != label_call.get("name", ""):
+        return False
+    o_args = output_call.get("arguments", {}) or {}
+    l_args = label_call.get("arguments", {}) or {}
+    if set(o_args.keys()) != set(l_args.keys()):
+        return False
+    return all(_values_types_match(o_args[k], l_args[k]) for k in l_args)
 
-        # 2. Param name + 3. Param type
-        if cname in tool_params:
-            declared = tool_params[cname]
-            declared_names = set(declared.keys())
 
-            if declared_names and cargs:
-                # Param name: fraction of provided params that are declared.
-                # Missing optional schema params are not penalized — the
-                # label match already covers whether a param was required.
-                matched = sum(1 for k in cargs if k in declared_names)
-                extra = sum(1 for k in cargs if k not in declared_names)
-                pname_acc += matched / max(len(cargs), 1)
-                if extra:
-                    logger.debug("[dim3] Extra params for %r: %s",
-                                 cname, [k for k in cargs if k not in declared_names])
-
-                # Param type
-                ptype_acc += _check_types(cargs, declared)
-            elif not declared_names:
-                pname_acc += 1.0
-                ptype_acc += 1.0
-            elif not cargs:
-                # No args but params declared → half credit for name
-                pname_acc += 0.5
-
-    # Normalize by N
-    score = (
-        (name_acc / n) * 0.5
-        + (pname_acc / n) * 0.3
-        + (ptype_acc / n) * 0.2
-    )
-
-    logger.debug("[dim3] N=%d name=%.3f pname=%.3f ptype=%.3f → %.3f",
-                 n, name_acc / n * 0.5, pname_acc / n * 0.3, ptype_acc / n * 0.2, score)
-
-    return max(0.0, min(1.0, score))
+def _count_label_matches(
+    output_calls: list[dict[str, Any]],
+    label_calls: list[dict[str, Any]],
+) -> int:
+    """Count label calls completely matched by an output call (one-to-one)."""
+    used: set[int] = set()
+    matched = 0
+    for label_call in label_calls:
+        for oi, out_call in enumerate(output_calls):
+            if oi in used:
+                continue
+            if _call_completely_matches(out_call, label_call):
+                used.add(oi)
+                matched += 1
+                break
+    return matched
 
 
 _TYPE_MAP = {
@@ -445,25 +456,6 @@ _TYPE_MAP = {
     "array": list, "list": list,
     "object": dict, "dict": dict,
 }
-
-
-def _check_types(
-    args: dict[str, Any],
-    declared: dict[str, dict],
-) -> float:
-    """Fraction of args with correct types."""
-    correct = 0
-    for k, v in args.items():
-        if k not in declared:
-            continue
-        dtype = declared[k].get("type", "")
-        expected = _TYPE_MAP.get(dtype.lower()) if dtype else None
-        if expected is None or isinstance(v, expected):
-            correct += 1
-        else:
-            logger.debug("[dim3] Type mismatch: %s=%s (expected %s, got %s)",
-                         k, v, dtype, type(v).__name__)
-    return correct / max(len(args), 1)
 
 
 # ============================================================================
@@ -708,6 +700,31 @@ def _format_call(call: dict[str, Any]) -> str:
     return name + "()"
 
 
+def undeclared_tool_penalty(
+    output_calls: list[dict[str, Any]],
+    available_tools: list[dict[str, Any]] | None,
+) -> float:
+    """Return the Dim 1 penalty for calling tools not declared in the system prompt.
+
+    Each model call whose name is not among the declared ``available_tools``
+    incurs ``-0.1``. If no tools are declared (``None``/empty), there is no
+    reference to check against, so no penalty is applied.
+
+    Args:
+        output_calls: Parsed tool calls from the model output.
+        available_tools: Tool definitions from the system prompt.
+
+    Returns:
+        Magnitude (non-negative float) of the total penalty to subtract; cap
+        to zero-score separately.
+    """
+    declared = {t.get("name", "") for t in (available_tools or []) if t.get("name")}
+    if not declared:
+        return 0.0
+    undeclared = sum(1 for c in output_calls if c.get("name", "") not in declared)
+    return 0.1 * undeclared
+
+
 def _guess_penalty(n_emitted: int) -> float:
     """Penalty for blind tool guessing: ``-0.1`` per emitted call, capped at ``-1.0``.
 
@@ -886,13 +903,15 @@ def compute_verifier_scores(
     trajectory: list[dict[str, Any]],
     *,
     available_tools: list[dict[str, Any]] | None = None,
+    label_calls: list[dict[str, Any]] | None = None,
     expects_no_tools: bool = False,
 ) -> dict[str, float]:
     """Compute Dim 2 + Dim 3 verifier scores.
 
     Args:
         trajectory: Normalized trajectory.
-        available_tools: Tool definitions for Dim 3 format check.
+        available_tools: Tool definitions for the Dim 2 format check.
+        label_calls: Ground truth tool calls for the Dim 3 label match.
         expects_no_tools: Label says no tools are needed for this task.
 
     Returns:
@@ -906,7 +925,6 @@ def compute_verifier_scores(
         ),
         "tool_call_format": check_tool_call_format(
             trajectory,
-            available_tools,
-            expects_no_tools=expects_no_tools,
+            label_calls=label_calls,
         ),
     }

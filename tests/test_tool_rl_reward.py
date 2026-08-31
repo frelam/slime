@@ -447,7 +447,9 @@ class TestComputeToolRlReward:
 
     def test_no_tool_label_think_only_collapses_format(self):
         """A think block with no response/tool_call after it is a format
-        violation — no full format credit even with a no-tool label."""
+        violation for Dim 2 (no full format credit even with a no-tool label).
+        Dim 3 does not detect it any longer: with an empty label it scores a
+        flat 1.0."""
         import asyncio
 
         from examples.tool_rl.reward.reward import compute_tool_rl_reward
@@ -470,8 +472,8 @@ class TestComputeToolRlReward:
 
         assert breakdown.tool_correctness == pytest.approx(1.0)
         assert breakdown.format_compliance == pytest.approx(0.0)
-        assert breakdown.tool_call_format == pytest.approx(0.0)
-        assert breakdown.total == pytest.approx(0.6)
+        assert breakdown.tool_call_format == pytest.approx(1.0)
+        assert breakdown.total == pytest.approx(0.8)
 
     def test_no_tool_label_no_think_plain_answer_scores_full(self):
         """Empty label + a no-reasoning (no think) plain answer is compatible:
@@ -722,7 +724,11 @@ class TestGuessPenalty:
         assert name_score == pytest.approx(0.5)
         assert param_score == pytest.approx(0.5)
 
-    def test_end_to_end_total_goes_negative_when_guessing(self):
+    def test_blind_guessing_still_penalized_by_dim1(self):
+        """Blind tool calls when the label expects none are still punished on
+        Dim 1 (base correctness goes negative). The guessed tools are not
+        declared in the system prompt, so the undeclared-tool penalty applies
+        and floors Dim 1 at 0.0 — it can never go below that."""
         import asyncio
 
         from examples.tool_rl.reward.reward import compute_tool_rl_reward
@@ -746,5 +752,68 @@ class TestGuessPenalty:
             )
         )
 
-        assert breakdown.tool_correctness == pytest.approx(-0.2)
-        assert breakdown.total < 0.0
+        # Base Dim 1 is -0.2 (blind guessing); the non-declared tools
+        # wrong_a/wrong_b incur an undeclared-tool penalty capped at 0.0.
+        assert breakdown.tool_correctness == pytest.approx(0.0)
+        assert breakdown.tool_call_format == pytest.approx(1.0)
+        assert 0.0 <= breakdown.total < 1.0
+
+    def test_undeclared_tools_penalized_in_dim1(self):
+        """Dim 1 penalizes model calls to tools not declared in the system
+        prompt (-0.1 each), even when hit calls are perfectly matched.
+
+        Two previously-equal cases now differ:
+          1. label 2 calls, model 4 calls, 2 hit + 2 unmatched that ARE
+             declared in the system prompt → no extra penalty.
+          2. same, but the 2 unmatched calls are NOT declared → extra -0.2.
+        """
+        import asyncio
+
+        from examples.tool_rl.reward.reward import compute_tool_rl_reward
+
+        class Args:
+            reward_weights = None
+
+        tools = [
+            {"name": "get_weather", "parameters": {"type": "object"}},
+            {"name": "get_time", "parameters": {"type": "object"}},
+        ]
+        label = [
+            {"name": "get_weather", "arguments": {"city": "Beijing"}},
+            {"name": "get_time", "arguments": {}},
+        ]
+        hit = (
+            "<tool_call><function=get_weather>"
+            '<parameter=city>"Beijing"</parameter>'
+            "</function></tool_call>\n"
+            "<tool_call><function=get_time></function></tool_call>\n"
+        )
+        # Case 1: unmatched calls use declared tools get_weather/get_time.
+        in_prompt = hit + (
+            "<tool_call><function=get_weather></function></tool_call>\n"
+            "<tool_call><function=get_time></function></tool_call>\n"
+        )
+        # Case 2: unmatched calls use tools NOT declared anywhere.
+        not_in_prompt = hit + (
+            "<tool_call><function=mystery_a></function></tool_call>\n"
+            "<tool_call><function=mystery_b></function></tool_call>\n"
+        )
+
+        def run(text):
+            traj = [_make_trajectory_record(text=text)]
+            return asyncio.run(
+                compute_tool_rl_reward(
+                    Args(), traj, "task",
+                    available_tools=tools, ground_truth_calls=label,
+                )
+            )
+
+        a = run(in_prompt)
+        b = run(not_in_prompt)
+
+        # Both match the 2 label calls; only case 2 carries the undeclared
+        # -0.2 penalty, so its Dim 1 is lower.
+        assert a.tool_correctness == pytest.approx(0.5)
+        assert b.tool_correctness == pytest.approx(0.3)
+        assert a.tool_correctness == pytest.approx(b.tool_correctness + 0.2)
+        assert b.details.get("undeclared_tool_penalty") == pytest.approx(0.2)
