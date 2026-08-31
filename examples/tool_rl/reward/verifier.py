@@ -50,20 +50,40 @@ logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
+# A raw ``<think>`` opener — used to detect an unclosed think block.
+_OPENING_RE = re.compile(r"<think>", re.IGNORECASE)
+
+
 def _check_strict_format(text: str) -> bool:
-    """Validate the top-level layout of a response's think/reason block.
+    """Validate the top-level layout of a response's think block.
 
-    Allowed layouts:
-      1. No thinking at all — a bare response text and/or ``<tool_call>``.
-      2. Exactly one think block (``<thinking>...</thinking>``), whether its
-         reasoning content is empty or not, and whether anything follows it
-         or not. ``think  response`` (empty reasoning) is acceptable.
+    The Qwen3 chat template makes the assistant emit ``<think>...</think>``
+    followed by a response and/or ``<tool_call>``.  ``<think>``/``</think>``
+    are not special tokens (``special: False``), so they survive SGLang
+    decoding and appear verbatim in the rollout text.
 
-    Rejected — a format violation only when there is MORE than one think
-    block, since that layout is ambiguous.
+    Rules:
+      1. ``<think>`` tags must be paired — an unclosed ``<think>`` opener
+         with no ``</think>`` is invalid.
+      2. More than one complete ``<think>...</think>`` block is invalid
+         (ambiguous layout).
+      3. Something (response text / tool_call) must follow the think block —
+         emitting reasoning and halting without an answer is the
+         "think-then-stop" collapse.
+      4. Otherwise valid: no think block at all, or exactly one complete
+         ``<think>...</think>`` block.
     """
     matches = list(_THINK_RE.finditer(text))
-    return len(matches) <= 1
+    # Every opener must have a matching closer — an unclosed <think> is a
+    # think-then-stop collapse.
+    if len(_OPENING_RE.findall(text)) != len(matches):
+        return False
+    if len(matches) > 1:
+        return False
+    if len(matches) == 1:
+        # A response or tool_call must follow the think block.
+        return text[matches[0].end():].strip() != ""
+    return True
 
 
 # Qwen XML tool call: <tool_call>...<function=NAME>...</function>...</tool_call>
@@ -194,9 +214,10 @@ def check_format_compliance(
     all_text = _get_agent_text(trajectory)
 
     # Strict gate: the response must be a well-formed thinking→response block
-    # with something (response text / tool_call) after it. Emitting only a
-    # think block and stopping is a format violation — even when it makes no
-    # tool calls.
+    # with something (response text / tool_call) after it. Emitting an
+    # unclosed ``<think>`` (think-then-stop collapse), more than one think
+    # block, or a think block with nothing after it is a format violation —
+    # even when it makes no tool calls.
     if not _check_strict_format(all_text):
         logger.debug("[dim2] Strict thinking→response format broken → 0.0")
         return 0.0

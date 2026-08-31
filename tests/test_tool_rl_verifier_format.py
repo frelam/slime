@@ -97,10 +97,20 @@ class TestThinkValidity:
 
     def test_repeated_think_zero(self):
         """Repeated think blocks break the strict single-block format → 0.0."""
-        text = (
-            " thinkinga response thinkingb response\n" + _xml_call()
-        )
+        text = "<think>a</think>\n<think>b</think>\n" + _xml_call()
         assert _format_score(text) == pytest.approx(0.0)
+
+    def test_unclosed_think_zero(self):
+        """An unclosed <think> (think-then-stop collapse) → 0.0."""
+        text = "<think>let me check the weather\n" + _xml_call()
+        assert _format_score(text) == pytest.approx(0.0)
+
+    def test_think_only_nothing_after_zero(self):
+        """A closed think block with no response/tool_call after it → 0.0."""
+        text = "<think>deep reasoning</think>"
+        assert _format_score(text) == pytest.approx(0.0)
+        assert _format_score(text, tools=None) == pytest.approx(0.0)
+        assert _format_score(text, expects_no_tools=True) == pytest.approx(0.0)
 
     def test_no_think_zero(self):
         text = _xml_call()
@@ -114,8 +124,8 @@ class TestThinkValidity:
     def test_interleaved_think_call_pairs_zero(self):
         """Interleaved repeated think blocks break the strict format → 0.0."""
         text = (
-            " thinkinga response\n" + _xml_call(value='"A"') + "\n"
-            " thinkingb response\n" + _xml_call(value='"B"')
+            "<think>a</think>\n" + _xml_call(value='"A"') + "\n"
+            "<think>b</think>\n" + _xml_call(value='"B"')
         )
         assert _format_score(text) == pytest.approx(0.0)
 
@@ -175,10 +185,9 @@ class TestMultipleToolCalls:
 # ============================================================================
 
 
-# Real think/reason tags as matched by _THINK_RE. Built from char codes so the
-# bytes stay exact (the raw ``<thinking>`` literal is not authorable directly).
-_THINK_OPEN = chr(60) + "think" + chr(62)  # <thinking>
-_THINK_CLOSE = chr(60) + "/think" + chr(62)  # </thinking>
+# Real think tags as emitted by the Qwen3 chat template.
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
 
 
 class TestNoTools:
@@ -197,11 +206,17 @@ class TestNoTools:
         text = "nothing to do"
         assert _format_score(text, tools=TOOLS, expects_no_tools=True) == pytest.approx(1.0)
 
-    def test_empty_think_block_allowed(self):
-        """An empty ``<thinking></thinking>`` with nothing else is acceptable —
-        empty reasoning is not a format violation."""
-        text = _THINK_OPEN + _THINK_CLOSE
+    def test_empty_think_block_with_answer_allowed(self):
+        """An empty ``<think></think>`` followed by an answer is acceptable —
+        empty reasoning alone is not a format violation."""
+        text = _THINK_OPEN + _THINK_CLOSE + "\nnothing to do"
         assert _format_score(text, tools=None) == pytest.approx(1.0)
+
+    def test_empty_think_block_alone_zero(self):
+        """A think block with nothing after it is the think-then-stop
+        collapse — a format violation even when no tools are defined."""
+        text = _THINK_OPEN + _THINK_CLOSE
+        assert _format_score(text, tools=None) == pytest.approx(0.0)
 
     def test_empty_block_with_tools_full_when_label_expects_none(self):
         """Empty blocks are not calls; with a no-tool label they don't fail."""
@@ -214,10 +229,14 @@ class TestToolCallFormatNoToolsExpected:
         assert _tool_call_format_score("no tools needed") == pytest.approx(0.0)
 
     def test_empty_think_block_allowed_with_no_tool_label(self):
-        """An empty reasoning block is acceptable even with a no-tool label."""
+        """An empty reasoning block followed by an answer is acceptable even
+        with a no-tool label; a think-only output is not."""
+        assert _tool_call_format_score(
+            _THINK_OPEN + _THINK_CLOSE + "\nno tools needed", expects_no_tools=True,
+        ) == pytest.approx(1.0)
         assert _tool_call_format_score(
             _THINK_OPEN + _THINK_CLOSE, expects_no_tools=True,
-        ) == pytest.approx(1.0)
+        ) == pytest.approx(0.0)
 
     def test_actual_calls_still_validated_when_label_expects_none(self):
         """A no-tool label doesn't disable Dim 3 if the model calls anyway."""

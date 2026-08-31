@@ -426,7 +426,9 @@ class TestComputeToolRlReward:
             reward_weights = None
 
         traj = [
-            _make_trajectory_record(text="<think>No tools are needed here.</think>"),
+            _make_trajectory_record(
+                text="<think>No tools are needed here.</think>\nNo tools are needed."
+            ),
         ]
         breakdown = asyncio.run(
             compute_tool_rl_reward(
@@ -442,6 +444,34 @@ class TestComputeToolRlReward:
         assert breakdown.format_compliance == pytest.approx(1.0)
         assert breakdown.tool_call_format == pytest.approx(1.0)
         assert breakdown.total == pytest.approx(1.0)
+
+    def test_no_tool_label_think_only_collapses_format(self):
+        """A think block with no response/tool_call after it is a format
+        violation — no full format credit even with a no-tool label."""
+        import asyncio
+
+        from examples.tool_rl.reward.reward import compute_tool_rl_reward
+
+        class Args:
+            reward_weights = None
+
+        traj = [
+            _make_trajectory_record(text="<think>No tools are needed here.</think>"),
+        ]
+        breakdown = asyncio.run(
+            compute_tool_rl_reward(
+                Args(),
+                traj,
+                "Task that needs no tool call",
+                available_tools=self._tools(),
+                ground_truth_calls=[],
+            )
+        )
+
+        assert breakdown.tool_correctness == pytest.approx(1.0)
+        assert breakdown.format_compliance == pytest.approx(0.0)
+        assert breakdown.tool_call_format == pytest.approx(0.0)
+        assert breakdown.total == pytest.approx(0.6)
 
     def test_no_tool_label_no_think_plain_answer_scores_full(self):
         """Empty label + a no-reasoning (no think) plain answer is compatible:
@@ -702,7 +732,6 @@ class TestGuessPenalty:
 
         tools = [{"name": "get_weather", "parameters": {"type": "object"}}]
         text = (
-            " thinkingok response\n"
             "<tool_call><function=wrong_a></function></tool_call>\n"
             "<tool_call><function=wrong_b></function></tool_call>"
         )
