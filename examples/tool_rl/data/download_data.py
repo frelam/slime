@@ -36,7 +36,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import random
 import re
 import sys
@@ -580,6 +579,316 @@ def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
 
 
 # ============================================================================
+# Data augmentation — negative samples & robustness perturbations
+# ============================================================================
+#
+# Motivation: the raw datasets are (almost) all positive samples — the label
+# always contains the "correct" tool calls, which encourages shortcut learning
+# (memorising parameter names, copying schema defaults, blindly calling a
+# tool whose *name* matches the query).  To counter this, a fraction of the
+# samples with ground-truth tool calls is perturbed in one of four ways:
+#
+#   1a. tool_rename     — rename a label tool in the prompt (description
+#                         unchanged); the label follows the new name.
+#                         Teaches: bind to the description, not the name.
+#   1b. desc_replace    — replace a label tool's description with an
+#                         unrelated one; the label becomes empty (no tool
+#                         should be called).  This is the negative sample:
+#                         match_tool_calls_against_label() already penalises
+#                         spurious calls when the label is empty.
+#   2.  param_rename    — rename parameter names in the tool schema; the
+#                         label's argument keys follow (values unchanged).
+#                         Teaches: read parameter descriptions, don't
+#                         memorise canonical parameter names.
+#   3.  default_shuffle — randomise ``default`` values in the tool schema.
+#                         Teaches: don't copy schema defaults into calls.
+#
+# Each augmented sample gets ``metadata["augmented"] = <strategy>``.
+
+# Unrelated tool names used for renames — clearly off-topic for typical
+# function-calling queries, but with the original description kept they
+# remain the "correct" tool under a new name.
+_IRRELEVANT_TOOL_NAMES = [
+    "blend_smoothie_recipe",
+    "translate_morse_code",
+    "calculate_mortgage_rate",
+    "compose_haiku_poem",
+    "render_star_chart",
+    "tune_guitar_strings",
+    "estimate_paint_coverage",
+    "decode_vin_number",
+]
+
+# Unrelated descriptions used for desc_replace — after the swap the tool is
+# no longer suitable for the query, so the correct behaviour is *no* call.
+_IRRELEVANT_DESCRIPTIONS = [
+    "Render a 3D animation of a rotating geometric shape.",
+    "Compose a short poem about the changing seasons.",
+    "Estimate the calorie count of a dish from its photo.",
+    "Generate chord progressions for a given musical key.",
+    "Simulate the orbit of a satellite around a planet.",
+    "Design a knitting pattern for a winter scarf.",
+]
+
+# Generic parameter names used for param_rename.
+_GENERIC_PARAM_NAMES = [
+    "input_value",
+    "query_text",
+    "target_item",
+    "config_option",
+    "content_body",
+    "request_field",
+    "user_option",
+    "item_reference",
+]
+
+
+def _augment_tool_copies(task: dict, name: str):
+    """Yield every schema copy of tool ``name`` (top-level + metadata).
+
+    Tasks carry two independent normalised copies of the tool list —
+    ``task["tools"]`` (consumed by the chat template via ``--tool-key``)
+    and ``task["metadata"]["tools"]`` (consumed by the reward via
+    ``generate.py``).  Both must stay in sync under any mutation.
+    """
+    seen = set()
+    for tool_list in (task.get("tools"), task.get("metadata", {}).get("tools")):
+        if not isinstance(tool_list, list):
+            continue
+        for t in tool_list:
+            if isinstance(t, dict) and t.get("name") == name and id(t) not in seen:
+                seen.add(id(t))
+                yield t
+
+
+def _label_tool_candidates(task: dict) -> list[str]:
+    """Names of tools that appear both in the label and in the prompt."""
+    gt = task.get("metadata", {}).get("ground_truth")
+    if not isinstance(gt, list) or not gt:
+        return []
+    label_names = {c.get("name") for c in gt if isinstance(c, dict) and c.get("name")}
+    prompt_names = {
+        t.get("name")
+        for t in (task.get("tools") or [])
+        if isinstance(t, dict) and t.get("name")
+    }
+    return sorted(label_names & prompt_names)
+
+
+def _rename_in_text(text: str, old: str, new: str) -> str:
+    return re.sub(r"\b" + re.escape(old) + r"\b", new, text)
+
+
+def _rename_in_messages(messages: list[dict], old: str, new: str) -> None:
+    """Keep embedded tool references (system prompt / history) consistent."""
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str) and old in content:
+            m["content"] = _rename_in_text(content, old, new)
+
+
+def _augment_tool_rename(task: dict, rng: random.Random) -> str | None:
+    """Strategy 1a: rename a label tool in the prompt; label follows."""
+    candidates = _label_tool_candidates(task)
+    if not candidates:
+        return None
+    old = rng.choice(candidates)
+    existing = {
+        t.get("name") for t in (task.get("tools") or []) if isinstance(t, dict)
+    }
+    pool = [n for n in _IRRELEVANT_TOOL_NAMES if n not in existing]
+    if not pool:
+        return None
+    new = rng.choice(pool)
+
+    for t in _augment_tool_copies(task, old):
+        t["name"] = new
+    gt = task["metadata"]["ground_truth"]
+    for call in gt:
+        if isinstance(call, dict) and call.get("name") == old:
+            call["name"] = new
+    _rename_in_messages(task.get("messages") or [], old, new)
+    if isinstance(task.get("label"), str) and old in task["label"]:
+        task["label"] = _rename_in_text(task["label"], old, new)
+
+    task["metadata"]["augmented"] = "tool_rename"
+    task["metadata"]["augment_detail"] = {"old": old, "new": new}
+    return "tool_rename"
+
+
+def _augment_desc_replace(task: dict, rng: random.Random) -> str | None:
+    """Strategy 1b: swap a label tool's description for an unrelated one.
+
+    After the swap no declared tool fits the query, so this becomes a
+    **negative sample**: ground_truth is emptied (``[]``, not ``None`` —
+    the reward distinguishes "label says no tools" from "no label").
+    """
+    candidates = _label_tool_candidates(task)
+    if not candidates:
+        return None
+    name = rng.choice(candidates)
+    new_desc = rng.choice(_IRRELEVANT_DESCRIPTIONS)
+    for t in _augment_tool_copies(task, name):
+        t["description"] = new_desc
+
+    task["label"] = ""
+    task["metadata"]["ground_truth"] = []
+    task["metadata"]["has_ground_truth"] = False
+    task["metadata"]["augmented"] = "desc_replace"
+    task["metadata"]["augment_detail"] = {"tool": name}
+    return "desc_replace"
+
+
+def _augment_param_rename(task: dict, rng: random.Random) -> str | None:
+    """Strategy 2: rename schema parameter names; label keys follow."""
+    candidates = _label_tool_candidates(task)
+    if not candidates:
+        return None
+    rng.shuffle(candidates)
+
+    for name in candidates:
+        # Collect the union of schema properties across both copies.
+        props: dict[str, Any] = {}
+        for t in _augment_tool_copies(task, name):
+            params = t.get("parameters")
+            if isinstance(params, dict) and isinstance(params.get("properties"), dict):
+                props.update(params["properties"])
+        if not props:
+            continue
+
+        gt = task["metadata"]["ground_truth"]
+        gt_arg_keys = {
+            k
+            for c in gt
+            if isinstance(c, dict) and c.get("name") == name
+            for k in (c.get("arguments") or {})
+        }
+        # Prefer renaming a parameter that the label actually uses.
+        choices = sorted(gt_arg_keys & set(props)) or sorted(props)
+        old = rng.choice(choices)
+        pool = [p for p in _GENERIC_PARAM_NAMES if p not in props]
+        if not pool:
+            continue
+        new = rng.choice(pool)
+
+        for t in _augment_tool_copies(task, name):
+            params = t.get("parameters")
+            if not isinstance(params, dict):
+                continue
+            p = params.get("properties")
+            if isinstance(p, dict) and old in p:
+                p[new] = p.pop(old)
+            req = params.get("required")
+            if isinstance(req, list):
+                params["required"] = [new if r == old else r for r in req]
+
+        for call in gt:
+            if isinstance(call, dict) and call.get("name") == name:
+                args = call.get("arguments")
+                if isinstance(args, dict) and old in args:
+                    args[new] = args.pop(old)
+
+        if isinstance(task.get("label"), str) and old in task["label"]:
+            task["label"] = _rename_in_text(task["label"], old, new)
+
+        task["metadata"]["augmented"] = "param_rename"
+        task["metadata"]["augment_detail"] = {"tool": name, "old": old, "new": new}
+        return "param_rename"
+    return None
+
+
+def _random_default_value(old: Any, ptype: str, rng: random.Random) -> Any:
+    """Random replacement for a schema ``default``, kept type-compatible."""
+    for _ in range(8):
+        if ptype == "integer":
+            v: Any = rng.randint(-1000, 1000)
+        elif ptype == "number":
+            v = round(rng.uniform(-1000, 1000), 2)
+        elif ptype == "boolean":
+            v = not old if isinstance(old, bool) else rng.random() < 0.5
+        elif ptype == "array":
+            v = []
+        elif ptype == "object":
+            v = {}
+        else:  # string / unknown
+            v = "".join(rng.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
+        if v != old:
+            return v
+    return None
+
+
+def _augment_default_shuffle(task: dict, rng: random.Random) -> str | None:
+    """Strategy 3: randomise ``default`` values in the tool schema."""
+    changed: list[str] = []
+    for tool_list in (task.get("tools"), task.get("metadata", {}).get("tools")):
+        if not isinstance(tool_list, list):
+            continue
+        for t in tool_list:
+            if not isinstance(t, dict):
+                continue
+            params = t.get("parameters")
+            if not isinstance(params, dict) or not isinstance(params.get("properties"), dict):
+                continue
+            for pinfo in params["properties"].values():
+                if not isinstance(pinfo, dict) or "default" not in pinfo:
+                    continue
+                v = _random_default_value(
+                    pinfo["default"], str(pinfo.get("type", "string")), rng,
+                )
+                if v is not None:
+                    pinfo["default"] = v
+                    if t.get("name") not in changed:
+                        changed.append(t.get("name"))
+
+    if not changed:
+        return None
+    task["metadata"]["augmented"] = "default_shuffle"
+    task["metadata"]["augment_detail"] = {"tools": changed}
+    return "default_shuffle"
+
+
+_AUGMENT_STRATEGIES = (
+    _augment_tool_rename,
+    _augment_desc_replace,
+    _augment_param_rename,
+    _augment_default_shuffle,
+)
+
+
+def augment_tasks(
+    tasks: list[dict[str, Any]],
+    ratio: float,
+    rng: random.Random,
+) -> int:
+    """Perturb a ``ratio`` fraction of positive samples (label has tool calls).
+
+    Each selected sample is mutated in place by the first applicable
+    strategy from a shuffled order.  Returns the number of augmented tasks.
+    """
+    if ratio <= 0 or not tasks:
+        return 0
+
+    eligible = [
+        i
+        for i, t in enumerate(tasks)
+        if isinstance(t.get("metadata", {}).get("ground_truth"), list)
+        and t["metadata"]["ground_truth"]
+    ]
+    rng.shuffle(eligible)
+    target = max(1, round(len(tasks) * ratio))
+
+    augmented = 0
+    for i in eligible[:target]:
+        strategies = list(_AUGMENT_STRATEGIES)
+        rng.shuffle(strategies)
+        for strategy in strategies:
+            if strategy(tasks[i], rng) is not None:
+                augmented += 1
+                break
+    return augmented
+
+
+# ============================================================================
 # Validation
 # ============================================================================
 
@@ -614,6 +923,13 @@ def main():
     parser.add_argument("--datasets", default="all")
     parser.add_argument("--max-samples", type=int, default=_DEFAULT_MAX)
     parser.add_argument("--seed", type=int, default=_SEED)
+    parser.add_argument(
+        "--augment-ratio",
+        type=float,
+        default=0.15,
+        help="Fraction of positive samples to perturb for robustness "
+        "(tool/param renames, negative samples, default shuffle). 0 disables.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -632,6 +948,11 @@ def main():
             continue
         tasks = loaders[name](args.max_samples)
         tasks = validate_tasks(tasks)
+        if tasks and args.augment_ratio > 0:
+            n_aug = augment_tasks(
+                tasks, args.augment_ratio, random.Random(args.seed),
+            )
+            logger.info("Augmented %d/%d %s samples", n_aug, len(tasks), name)
         if tasks:
             rng = random.Random(args.seed)
             rng.shuffle(tasks)
